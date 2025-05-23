@@ -20,16 +20,18 @@ func FindStaleRepos(root string, thresholdDays int) ([]string, error) {
 		if info.IsDir() && info.Name() == ".git" {
 			repoPath := filepath.Dir(path)
 
-			cmd := exec.Command("git", "log", "-1", "--format=%cd")
+			cmd := exec.Command("git", "log", "-1", "--format=%cd", "--date=iso")
 			cmd.Dir = repoPath
 			output, err := cmd.Output()
 			if err != nil {
+				log.Printf("Error running git log for repo %s: %v", repoPath, err)
 				return nil
 			}
 
 			dateStr := strings.TrimSpace(string(output))
-			lastCommit, err := time.Parse("Mon Jan 2 15:04:05 2006 -0700", dateStr)
+			lastCommit, err := time.Parse("2006-01-02 15:04:05 -0700", dateStr)
 			if err != nil {
+				log.Printf("Error parsing date for repo %s (date string: %s): %v", repoPath, dateStr, err)
 				return nil
 			}
 
