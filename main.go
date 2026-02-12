@@ -1,85 +1,101 @@
 package main
 
 import (
-	"fmt"
-	"log"
+	"log/slog"
 	"os"
 
-
-	"github.com/b-isry/gitsafe/archiver"
-	"github.com/b-isry/gitsafe/cloud"
-	"github.com/b-isry/gitsafe/scanner"
+	"github.com/b-isry/gitsafe/internal/archiver"
+	"github.com/b-isry/gitsafe/internal/cloud"
+	"github.com/b-isry/gitsafe/internal/config"
+	"github.com/b-isry/gitsafe/internal/scanner"
 	"github.com/urfave/cli/v2"
 )
 
 func main() {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
 	app := &cli.App{
-		Name: "GitSafe",
-		Usage: "Backup stale git rpos by zipping and optionally uploading to Googl Drive",
+		Name:  "GitSafe",
+		Usage: "Disaster recovery backup for stale git repositories",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
-				Name: "root",
-				Usage: "Root directory to scan for git repos",
-				Required: true,
+				Name:  "config",
+				Usage: "Path to YAML config file",
+				Value: "config.yaml",
+			},
+			&cli.StringFlag{
+				Name:  "root",
+				Usage: "Root directory to scan for git repos (overrides config)",
 			},
 			&cli.IntFlag{
-				Name: "days",
+				Name:  "days",
 				Usage: "Days since last commit to consider a repo stale",
 				Value: 60,
 			},
 			&cli.StringFlag{
-				Name: "out",
-				Usage: "Output directory for archived repos",
+				Name:  "out",
+				Usage: "Output directory for backup bundles",
 				Value: "./backups",
 			},
 			&cli.BoolFlag{
-				Name: "cloud",
-				Usage: "Upload zipped repos  to Google Drive",
+				Name:  "cloud",
+				Usage: "Upload backups to Google Drive (overrides config)",
 				Value: false,
+			},
+			&cli.BoolFlag{
+				Name:  "backup-history",
+				Usage: "Preserve full git history in backup bundles (overrides config)",
+				Value: true,
 			},
 		},
 		Action: func(ctx *cli.Context) error {
-			root := ctx.String("root")
-			days := ctx.Int("days")
-			outdir := ctx.String("out")
-			uploadToCloud := ctx.Bool("cloud")
-				
-			log.Printf("Scanning %s for stale repos (>%d days)...\n", root, days)
+			cfg, err := config.Load(ctx.String("config"))
+			if err != nil {
+				return err
+			}
+			config.ApplyCLIOverrides(ctx, &cfg)
 
-			staleRepos, err := scanner.FindStaleRepos(root, days)
-			if err != nil{
-				return fmt.Errorf("failed to scan repos: %v", err)
+			if err := cfg.Validate(); err != nil {
+				return err
+			}
+			if err := archiver.Validate(); err != nil {
+				return err
 			}
 
-			if len(staleRepos) == 0{
-				fmt.Println("No stale repos found.")
+			logger.Info("starting repository scan", "rootPath", cfg.RootPath, "days", cfg.Days)
+			staleRepos, err := scanner.FindStaleRepos(cfg.RootPath, cfg.Days, logger)
+			if err != nil {
+				return err
+			}
+
+			if len(staleRepos) == 0 {
+				logger.Info("no stale repositories found")
 				return nil
 			}
+
 			for _, repo := range staleRepos {
-				fmt.Printf("Archiving: %s\n", repo)
-				zipPath, err := archiver.ZipRepo(repo, outdir)
+				bundlePath, err := archiver.BundleRepo(repo, cfg.OutputPath, cfg.BackupHistory, logger)
 				if err != nil {
-					log.Printf("failed to zip %s: %v\n", repo, err)
+					logger.Error("failed to create backup bundle", "repo", repo, "error", err)
 					continue
 				}
 
-				fmt.Printf("Zipped to %s\n", zipPath)
-
-				if uploadToCloud {
-					fmt.Printf("Uploading to drive: %s\n", zipPath)
-					err = cloud.UploadToDrive(zipPath)
+				if cfg.Cloud.Enabled {
+					err = cloud.UploadToDrive(ctx.Context, bundlePath, cfg.Cloud, logger)
 					if err != nil {
-						log.Printf("Upload failed: %v\n", err)
-					} else {
-						fmt.Println("Uploaded successfully.")
+						logger.Error("cloud upload failed", "bundlePath", bundlePath, "error", err)
 					}
 				}
 			}
-			fmt.Println("Done.")
+
+			logger.Info("backup run completed", "staleRepos", len(staleRepos))
 			return nil
 		},
 	}
-	if err := app.Run(os.Args); err != nil{
-		log.Fatal(err)
+
+	if err := app.Run(os.Args); err != nil {
+		logger.Error("gitsafe failed", "error", err)
+		os.Exit(1)
 	}
 }

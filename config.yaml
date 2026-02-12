@@ -1,0 +1,7 @@
+rootPath: .
+days: 60
+outputPath: ./backups
+backupHistory: true
+cloud:
+  enabled: false
+  credentialsFile: credentials.json
