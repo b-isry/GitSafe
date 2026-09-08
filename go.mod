@@ -4,6 +4,7 @@ go 1.24.1
 
 require (
 	github.com/urfave/cli/v2 v2.27.6
+	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/oauth2 v0.30.0
 	google.golang.org/api v0.234.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -14,9 +15,11 @@ require (
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.7.0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.5 // indirect
+	github.com/danieljoos/wincred v1.2.3 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.6 // indirect
