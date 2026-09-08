@@ -1,7 +1,22 @@
-rootPath: .
+rootPath: C:\Users\Bisrat\Desktop\Projects
 days: 60
-outputPath: ./backups
+outputPath: C:\Users\Bisrat\Desktop\Projects\GitSafe\backups
 backupHistory: true
+retention:
+    keepLocal: 0
+    keepLocalDays: 0
+    keepJobs: 0
+    keepDriveDays: 0
+    driveRetentionEnabled: false
+    scheduledCleanupEnabled: false
+    scheduledCleanupIntervalDays: 0
+    cleanupHistoryLimit: 0
 cloud:
-  enabled: false
-  credentialsFile: credentials.json
+    enabled: false
+    credentialsFile: credentials.json
+notifications:
+    enabled: false
+    type: webhook
+    notifyOnSuccess: false
+    notifyOnFailure: true
+repositoryRetentionOverrides: []
