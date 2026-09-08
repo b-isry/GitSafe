@@ -1,0 +1,131 @@
+{{define "actions"}}
+<button class="btn btn--ghost" id="scanBtn" type="button">
+  <span class="btn__label">Scan now</span>
+</button>
+{{end}}
+
+{{define "content"}}
+<section class="section">
+  <div class="panel">
+    <div class="stats">
+      <div class="stat">
+        <div class="stat__value mono">{{.Dashboard.Stats.ReposScanned}}</div>
+        <div class="stat__label">Repositories</div>
+      </div>
+      <div class="stat {{if gt .Dashboard.Stats.Stale 0}}stat--danger{{end}}">
+        <div class="stat__value mono">{{.Dashboard.Stats.Stale}}</div>
+        <div class="stat__label">Stale</div>
+      </div>
+      <div class="stat stat--accent">
+        <div class="stat__value mono">{{.Dashboard.Stats.Backups}}</div>
+        <div class="stat__label">Backed up</div>
+      </div>
+      <div class="stat {{if gt .Dashboard.Stats.Attention 0}}stat--danger{{end}}">
+        <div class="stat__value mono">{{.Dashboard.Stats.Attention}}</div>
+        <div class="stat__label">Needs attention</div>
+      </div>
+    </div>
+  </div>
+  <div class="summary-meta">
+    <span class="mono text-xs neutral-weak">
+      {{if .Dashboard.Stats.LastScan.IsZero}}Not scanned yet{{else}}Last scan {{.Dashboard.Stats.LastScan.Format "2006-01-02 15:04"}}{{end}}
+    </span>
+  </div>
+</section>
+
+{{if .Scanning}}
+<section class="section">
+  <div class="scan-banner" id="scanBanner" data-scanning="true">
+    <span class="text-sm">Scanning repositories…</span>
+    <div class="progress progress--indeterminate" aria-hidden="true"><div class="progress__bar"></div></div>
+  </div>
+</section>
+{{else}}
+<div id="scanBanner" hidden data-scanning="false"></div>
+{{end}}
+
+{{if .Skipped}}
+<p class="scan-note" id="skippedNote">Notice: {{len .Skipped}} {{if eq (len .Skipped) 1}}repository could not{{else}}repositories could not{{end}} be inspected and were skipped.</p>
+{{end}}
+
+<section class="section">
+  <div class="panel">
+    <div class="panel__head">Repositories</div>
+    <div class="selection-toolbar" id="selectionToolbar">
+      <span class="selection-toolbar__status" id="selectedCount" aria-live="polite">Nothing selected</span>
+      {{if gt .Dashboard.Stats.Stale 0}}
+      <button class="btn btn--ghost" id="selectStaleBtn" type="button">Select all stale</button>
+      {{end}}
+      <button class="btn btn--ghost" id="clearSelectionBtn" type="button" hidden>Clear</button>
+      <button class="btn btn--primary" id="backupSelectedBtn" type="button" disabled>Back up selected</button>
+    </div>
+    <div class="panel__body panel__body--flush">
+      <table class="table table--rows" id="repoTable">
+        <thead>
+          <tr>
+            <th class="check-col" scope="col"><span class="visually-hidden">Select</span></th>
+            <th>Repository</th>
+            <th>Source</th>
+            <th>Last commit</th>
+            <th>Staleness</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Dashboard.Repos}}
+          <tr class="row-enter js-toggle-select {{if .Stale}}is-stale{{end}}" data-path="{{.Path}}">
+            <td class="check-col">
+              <input class="repo-select" type="checkbox" data-path="{{.Path}}" aria-label="Select {{.Name}}" tabindex="-1">
+            </td>
+            <td>
+              <a class="repo-link" href="/repositories/{{.ID}}" data-no-select="true">{{.Name}}</a>
+              <div class="mono text-xs neutral-weak">{{.Path}}</div>
+            </td>
+            <td class="neutral-weak">{{.Source}}</td>
+            <td class="mono">{{.LastCommit.Format "2006-01-02"}}</td>
+            <td class="mono">{{if .StaleDays}}{{.StaleDays}}d{{else}}—{{end}}</td>
+            <td><span class="status status--{{repoStatus .}}" data-path="{{.Path}}" data-repo-status>{{statusLabel (repoStatus .)}}</span></td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {{if and (not .Dashboard.Repos) (not .Scanning)}}
+  <div class="empty">
+    <p class="empty__title">No repositories</p>
+    <p class="empty__body">No repositories were found in your root folder. Check your folder choice in Settings.</p>
+  </div>
+  {{end}}
+</section>
+
+<section class="section">
+  <div class="panel">
+    <div class="panel__head">Recent backups</div>
+    <div class="panel__body panel__body--flush">
+      <table class="table table--rows">
+        <thead>
+          <tr>
+            <th>Repository</th>
+            <th>Bundle</th>
+            <th>Size</th>
+            <th>Created</th>
+            <th>Upload</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Dashboard.Backups}}
+          <tr class="row-enter">
+            <td><span class="mono neutral-strong">{{.Repo}}</span></td>
+            <td class="mono neutral-weak">{{.Filename}}</td>
+            <td class="mono">{{humanSize .SizeBytes}}</td>
+            <td class="mono">{{.Created.Format "2006-01-02 15:04"}}</td>
+            <td>{{if .Uploaded}}<span class="status status--protected">Uploaded</span>{{else}}<span class="status status--stale">Local</span>{{end}}</td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+{{end}}

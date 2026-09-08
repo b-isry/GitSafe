@@ -1,0 +1,51 @@
+{{define "content"}}
+<section class="section">
+  <nav class="filters" aria-label="Filter repositories">
+    <a class="filter {{if eq .Filter ""}}is-active{{end}}" href="/repositories">All</a>
+    <a class="filter {{if eq .Filter "stale"}}is-active{{end}}" href="/repositories?filter=stale">Stale</a>
+    <a class="filter {{if eq .Filter "backed-up"}}is-active{{end}}" href="/repositories?filter=backed-up">Backed up</a>
+    <a class="filter {{if eq .Filter "not-backed-up"}}is-active{{end}}" href="/repositories?filter=not-backed-up">Not backed up</a>
+  </nav>
+</section>
+
+<section class="section">
+  <div class="panel">
+    <div class="panel__head">Repositories</div>
+    <div class="panel__body panel__body--flush">
+      <table class="table table--rows">
+        <thead>
+          <tr>
+            <th>Repository</th>
+            <th>Last commit</th>
+            <th>Age</th>
+            <th>Stale</th>
+            <th>Backup</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Repos}}
+          <tr class="row-enter">
+            <td>
+              <a class="repo-link" href="/repositories/{{.ID}}">{{.Name}}</a>
+              <div class="mono text-xs neutral-weak">{{.Path}}</div>
+            </td>
+            <td class="mono">{{.LastCommit.Format "2006-01-02"}}</td>
+            <td class="mono">{{if .StaleDays}}{{.StaleDays}}d{{else}}—{{end}}</td>
+            <td>{{if .Stale}}<span class="status status--stale">Stale</span>{{else}}<span class="status status--protected">Current</span>{{end}}</td>
+            <td>{{if eq .BackupStatus "backed-up"}}<span class="status status--protected">Backed up</span>{{else}}<span class="status status--stale">Not backed up</span>{{end}}</td>
+            <td class="row-action"><a class="btn btn--ghost" href="/repositories/{{.ID}}">View</a></td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {{if not .Repos}}
+  <div class="empty">
+    <p class="empty__title">No repositories</p>
+    <p class="empty__body">No repositories match this filter.</p>
+  </div>
+  {{end}}
+</section>
+{{end}}

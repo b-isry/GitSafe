@@ -1,0 +1,118 @@
+{{define "setup"}}<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Setup · GitSafe</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="setup">
+    <div class="setup__panel">
+      <div class="setup__brand">
+        <span class="brand__mark" aria-hidden="true"></span>
+        <span class="brand__name">GitSafe</span>
+      </div>
+
+      <div class="panel">
+        <div class="panel__head">Choose a folder to get started</div>
+        <div class="panel__body">
+          <p class="text-sm neutral-mid setup__intro">
+            GitSafe scans the folder you choose to find your Git repositories and
+            protects them with bundles. Pick the folder that contains your projects.
+          </p>
+
+          <div class="field" data-field="rootPath">
+            <label class="field__label" id="rootPathLabel">Where are your projects?</label>
+            <div class="folder-picker">
+              <div class="folder-picker__current">
+                <div class="folder-picker__name" id="rootNameDisplay"></div>
+                <div class="mono text-xs neutral-weak folder-picker__path" id="rootPathDisplay"></div>
+              </div>
+              <button class="btn btn--primary" id="chooseFolderBtn" type="button">Choose folder</button>
+            </div>
+            <input id="setupPath" name="rootPath" type="hidden">
+            <p class="field__hint" id="setupPathHint">Browse to the folder containing your projects.</p>
+          </div>
+
+          <div id="setupError" class="form__flash form__flash--error" role="alert" hidden></div>
+
+          <div class="form__actions">
+            <button class="btn btn--primary" id="startBtn" type="button" disabled>Start scanning</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script src="/static/folders.js"></script>
+  <script>
+  (function () {
+    "use strict";
+    var pathInput = document.getElementById("setupPath");
+    var nameDisplay = document.getElementById("rootNameDisplay");
+    var pathDisplay = document.getElementById("rootPathDisplay");
+    var chooseBtn = document.getElementById("chooseFolderBtn");
+    var startBtn = document.getElementById("startBtn");
+    var errorBox = document.getElementById("setupError");
+
+    function showError(msg) {
+      if (!errorBox) return;
+      errorBox.textContent = msg || "";
+      errorBox.hidden = !msg;
+    }
+
+    function setPath(path) {
+      pathInput.value = path;
+      if (pathDisplay) { pathDisplay.textContent = path; }
+      if (nameDisplay) {
+        var parts = path.replace(/[/\\]+$/, "").split(/[/\\]/);
+        nameDisplay.textContent = parts[parts.length - 1] || path;
+      }
+      startBtn.disabled = !path;
+    }
+
+    if (chooseBtn && window.GitSafeFolderBrowser) {
+      chooseBtn.addEventListener("click", function () {
+        showError("");
+        window.GitSafeFolderBrowser.open({
+          title: "Where are your projects?",
+          startPath: pathInput.value,
+          onSelect: setPath
+        });
+      });
+    } else if (chooseBtn) {
+      chooseBtn.disabled = true;
+      showError("Folder browsing is unavailable.");
+    }
+
+    if (startBtn) {
+      startBtn.addEventListener("click", function () {
+        if (startBtn.disabled) return;
+        startBtn.disabled = true;
+        startBtn.textContent = "Scanning…";
+        showError("");
+        fetch("/setup", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ rootPath: pathInput.value })
+        })
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            if (d && d.ok && d.redirect) { window.location.href = d.redirect; return; }
+            showError((d && d.error) || "Could not start scanning.");
+            startBtn.disabled = false;
+            startBtn.textContent = "Start scanning";
+          })
+          .catch(function () {
+            showError("Could not reach the server. Try again.");
+            startBtn.disabled = false;
+            startBtn.textContent = "Start scanning";
+          });
+      });
+    }
+  })();
+  </script>
+</body>
+</html>
+{{end}}

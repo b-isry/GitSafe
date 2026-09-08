@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.PageTitle}} · GitSafe</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app" id="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar__brand">
+        <span class="brand__mark" aria-hidden="true"></span>
+        <span class="brand__name">GitSafe</span>
+      </div>
+      <nav class="nav" aria-label="Primary">
+        <a class="nav__item {{if eq .Active "dashboard"}}is-active{{end}}" href="/" {{if eq .Active "dashboard"}}aria-current="page"{{end}}>Dashboard</a>
+        <a class="nav__item {{if eq .Active "repositories"}}is-active{{end}}" href="/repositories" {{if eq .Active "repositories"}}aria-current="page"{{end}}>Repositories</a>
+        <a class="nav__item {{if eq .Active "cloud-repositories"}}is-active{{end}}" href="/cloud-repositories" {{if eq .Active "cloud-repositories"}}aria-current="page"{{end}}>Cloud Repositories</a>
+        <a class="nav__item {{if eq .Active "backups"}}is-active{{end}}" href="/backups" {{if eq .Active "backups"}}aria-current="page"{{end}}>Backups</a>
+        <a class="nav__item {{if eq .Active "settings"}}is-active{{end}}" href="/settings" {{if eq .Active "settings"}}aria-current="page"{{end}}>Settings</a>
+      </nav>
+      <div class="sidebar__footer">
+        <span class="mono text-xs neutral-weak">local · v0.1.0</span>
+      </div>
+    </aside>
+
+    <div class="main">
+      <div class="progress progress--indeterminate" id="routeProgress" hidden></div>
+      <header class="topbar">
+        <button class="icon-btn nav-toggle" id="navToggle" type="button"
+                aria-label="Toggle navigation" aria-expanded="false" aria-controls="sidebar">
+          <span class="hamburger" aria-hidden="true"></span>
+        </button>
+        <div class="topbar__title">{{.PageTitle}}</div>
+        <div class="topbar__actions">
+          {{block "actions" .}}{{end}}
+        </div>
+      </header>
+
+      <main class="content" id="content">
+        {{block "content" .}}{{end}}
+      </main>
+    </div>
+  </div>
+  <div class="scrim" id="scrim" hidden></div>
+  <script src="/static/folders.js"></script>
+  <script src="/static/app.js"></script>
+  <script src="/static/cloud.js"></script>
+</body>
+</html>

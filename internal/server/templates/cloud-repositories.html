@@ -1,0 +1,155 @@
+{{define "content"}}
+<section class="section">
+  <div class="panel" id="cloudRepos">
+    <div class="panel__head">Cloud Repositories</div>
+    <div class="panel__body">
+      {{if not .Cloud.Configured}}
+      <div class="empty">
+        <p class="empty__title">GitHub not configured</p>
+        <p class="empty__body">Set GITSAFE_GITHUB_CLIENT_SECRET and a client id to enable cloud repositories.</p>
+      </div>
+      {{else if not .Cloud.Connected}}
+      <div class="empty">
+        <p class="empty__title">GitHub not connected</p>
+        <p class="empty__body"><a class="btn btn--primary" href="/api/auth/github">Connect GitHub</a></p>
+      </div>
+      {{else}}
+      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-bottom:1rem">
+        <span class="text-sm neutral-weak">Drive:</span>
+        <span class="status status--progress" id="driveStatus">Checking…</span>
+        <span class="text-sm neutral-weak" id="driveDetail" hidden></span>
+      </div>
+      <div class="cloud-loading" id="cloudLoading">Loading repositories…</div>
+      <div class="cloud-error" id="cloudError" hidden></div>
+      <div class="cloud-toolbar" id="cloudToolbar" hidden>
+        <button class="btn btn--primary" id="protectSelectedBtn" type="button" disabled>Protect selected</button>
+        <span class="mono text-sm neutral-weak" id="cloudSelected">Nothing selected</span>
+        <span class="form__flash" id="cloudFlash" hidden></span>
+      </div>
+      <table class="table table--rows" id="cloudTable" hidden>
+        <thead>
+          <tr>
+            <th></th>
+            <th>Repository</th>
+            <th>Default branch</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty" id="cloudEmpty" hidden>
+        <p class="empty__title">No repositories</p>
+        <p class="empty__body">No GitHub repositories were found for this account.</p>
+      </div>
+
+      <div class="panel__head section" style="margin-top:2rem">
+        <div class="cloud-toolbar" style="display:flex;align-items:center;justify-content:space-between;width:100%">
+          <span>Protected</span>
+          <button class="btn" id="backupAllBtn" type="button" disabled>Backup all</button>
+        </div>
+      </div>
+      <table class="table table--rows" id="protectedTable">
+        <thead>
+          <tr>
+            <th>Repository</th>
+            <th>Default branch</th>
+            <th>Protected since</th>
+            <th>Backup</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty" id="protectedEmpty" hidden>
+        <p class="empty__title">Nothing protected</p>
+        <p class="empty__body">Select repositories above and protect them to begin.</p>
+      </div>
+      <span class="form__flash" id="backupFlash" hidden></span>
+
+      <div class="panel__head section" style="margin-top:2rem">Recent backups</div>
+      <div class="cloud-loading" id="historyLoading" hidden>Loading backups…</div>
+      <table class="table table--rows" id="historyTable">
+        <thead>
+          <tr>
+            <th>Repository</th>
+            <th>Bundle</th>
+            <th>Created</th>
+            <th>Size</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty" id="historyEmpty" hidden>
+        <p class="empty__title">No backups yet</p>
+        <p class="empty__body">Back up a protected repository to create your first bundle.</p>
+      </div>
+
+      <div class="panel__head section" style="margin-top:2rem">Retention &amp; cleanup</div>
+      <p class="text-sm neutral-weak">All fields default to off; nothing is deleted until you enable it. Cleanup never touches a repository with a backup currently running.</p>
+      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
+        <label class="field__label" for="retKeepLocal">Keep local backups</label>
+        <input type="number" class="field__input" id="retKeepLocal" min="0" placeholder="e.g. 10" style="width:6rem">
+        <label class="text-sm neutral-weak" for="retKeepLocal">copies</label>
+        <label class="field__label" for="retKeepDays">or days</label>
+        <input type="number" class="field__input" id="retKeepDays" min="0" placeholder="e.g. 30" style="width:6rem">
+      </div>
+      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
+        <label class="field__label" for="retKeepJobs">Keep job history</label>
+        <input type="number" class="field__input" id="retKeepJobs" min="0" placeholder="e.g. 20" style="width:6rem">
+        <span class="text-sm neutral-weak">entries</span>
+        <label class="field__label" for="retKeepDriveDays">Drive copies older than</label>
+        <input type="number" class="field__input" id="retKeepDriveDays" min="0" placeholder="e.g. 90" style="width:6rem">
+        <span class="text-sm neutral-weak">days</span>
+      </div>
+      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
+        <label class="field__label" for="retDriveEnabled"><input type="checkbox" id="retDriveEnabled"> Delete Drive copies too</label>
+        <span class="text-sm neutral-weak" id="retDriveHint" hidden></span>
+      </div>
+      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
+        <label class="field__label" for="retSchedEnabled"><input type="checkbox" id="retSchedEnabled"> Scheduled cleanup</label>
+        <label class="field__label" for="retSchedDays">every</label>
+        <input type="number" class="field__input" id="retSchedDays" min="1" placeholder="e.g. 7" style="width:6rem">
+        <span class="text-sm neutral-weak">days</span>
+      </div>
+      <div class="text-sm neutral-weak" id="retSchedStatus" style="margin-top:0.5rem"></div>
+      <div class="panel__head section" style="margin-top:2rem">Notifications</div>
+      <p class="text-sm neutral-weak">Receive a cleanup result summary after each run. Nothing is sent until you enable it. The auth token is write-only and is never shown again.</p>
+      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
+        <label class="field__label" for="notifEnabled"><input type="checkbox" id="notifEnabled"> Enable webhook notifications</label>
+      </div>
+      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
+        <label class="field__label" for="notifUrl">Webhook URL</label>
+        <input type="url" class="field__input" id="notifUrl" placeholder="https://hooks.example.com/gitsafe" style="width:26rem">
+        <label class="field__label" for="notifTimeout">Timeout</label>
+        <input type="number" class="field__input" id="notifTimeout" min="1" value="10" style="width:4rem">
+        <span class="text-sm neutral-weak">seconds</span>
+      </div>
+      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
+        <label class="field__label" for="notifAuthHeader">Auth header</label>
+        <input class="field__input" id="notifAuthHeader" placeholder="Authorization" style="width:12rem">
+        <label class="field__label" for="notifAuthToken">Token</label>
+        <input type="password" class="field__input" id="notifAuthToken" placeholder="leave blank to keep" style="width:16rem">
+        <span class="text-sm neutral-weak" id="notifAuthHint" hidden></span>
+      </div>
+      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
+        <button class="btn" id="notifTestBtn" type="button">Send test</button>
+        <span class="form__flash" id="notifFlash" hidden></span>
+      </div>
+      <div class="panel__head section" style="margin-top:2rem">Per-repository overrides</div>
+      <p class="text-sm neutral-weak">Tune retention for individual repositories. Empty fields inherit the global policy; a 0 means "keep all".</p>
+      <div id="overrideList" style="margin-top:1rem"></div>
+      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:0.5rem">
+        <button class="btn" id="overrideAddBtn" type="button">Add override</button>
+      </div>
+      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
+        <button class="btn btn--primary" id="retSaveBtn" type="button">Save</button>
+        <button class="btn" id="retRunBtn" type="button">Run cleanup now</button>
+        <span class="form__flash" id="retFlash" hidden></span>
+      </div>
+      <div class="text-sm neutral-weak" id="retResult" style="margin-top:1rem"></div>
+      {{end}}
+    </div>
+  </div>
+</section>
+{{end}}
