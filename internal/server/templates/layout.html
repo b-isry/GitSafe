@@ -8,44 +8,44 @@
 </head>
 <body>
   <div class="app" id="app">
-    <aside class="sidebar" id="sidebar">
-      <div class="sidebar__brand">
+    <header class="topbar-nav">
+      <a class="topbar-nav__brand" href="/" aria-label="GitSafe home">
         <span class="brand__mark" aria-hidden="true"></span>
         <span class="brand__name">GitSafe</span>
-      </div>
-      <nav class="nav" aria-label="Primary">
-        <a class="nav__item {{if eq .Active "dashboard"}}is-active{{end}}" href="/" {{if eq .Active "dashboard"}}aria-current="page"{{end}}>Dashboard</a>
-        <a class="nav__item {{if eq .Active "repositories"}}is-active{{end}}" href="/repositories" {{if eq .Active "repositories"}}aria-current="page"{{end}}>Repositories</a>
-        <a class="nav__item {{if eq .Active "cloud-repositories"}}is-active{{end}}" href="/cloud-repositories" {{if eq .Active "cloud-repositories"}}aria-current="page"{{end}}>Cloud Repositories</a>
-        <a class="nav__item {{if eq .Active "backups"}}is-active{{end}}" href="/backups" {{if eq .Active "backups"}}aria-current="page"{{end}}>Backups</a>
-        <a class="nav__item {{if eq .Active "settings"}}is-active{{end}}" href="/settings" {{if eq .Active "settings"}}aria-current="page"{{end}}>Settings</a>
-      </nav>
-      <div class="sidebar__footer">
-        <span class="mono text-xs neutral-weak">local · v0.1.0</span>
-      </div>
-    </aside>
-
-    <div class="main">
-      <div class="progress progress--indeterminate" id="routeProgress" hidden></div>
-      <header class="topbar">
-        <button class="icon-btn nav-toggle" id="navToggle" type="button"
-                aria-label="Toggle navigation" aria-expanded="false" aria-controls="sidebar">
-          <span class="hamburger" aria-hidden="true"></span>
-        </button>
-        <div class="topbar__title">{{.PageTitle}}</div>
-        <div class="topbar__actions">
-          {{block "actions" .}}{{end}}
+      </a>
+      {{if .Cloud.Connected}}
+      <div class="conn-pills">
+        <div class="conn-pill" id="githubPill">
+          <button class="conn-pill__btn" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="GitHub account actions">
+            <span class="conn-pill__dot conn-pill__dot--on" aria-hidden="true"></span>
+            <span class="conn-pill__label">@{{.Cloud.Login}}</span>
+            <svg class="conn-pill__chevron" width="10" height="10" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div class="conn-pill__menu" role="menu" aria-label="GitHub account actions">
+            <button class="conn-pill__item" type="button" role="menuitem" data-disconnect="github">Disconnect GitHub</button>
+          </div>
         </div>
-      </header>
+        <div class="conn-pill" id="drivePill">
+          <button class="conn-pill__btn" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Google Drive account actions">
+            <span class="conn-pill__dot" id="drivePillDot" aria-hidden="true"></span>
+            <span class="conn-pill__label" id="drivePillLabel">Drive…</span>
+            <svg class="conn-pill__chevron" width="10" height="10" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div class="conn-pill__menu" role="menu" aria-label="Google Drive account actions">
+            <a class="conn-pill__item" role="menuitem" id="drivePillConnect" href="/api/auth/drive" hidden>Connect Google Drive</a>
+            <button class="conn-pill__item" type="button" role="menuitem" id="drivePillDisconnect" data-disconnect="drive" hidden>Disconnect Drive</button>
+          </div>
+        </div>
+      </div>
+      {{else}}
+      <span class="topbar-nav__version mono">v0.1.0</span>
+      {{end}}
+    </header>
 
-      <main class="content" id="content">
-        {{block "content" .}}{{end}}
-      </main>
-    </div>
+    <main class="content" id="content">
+      {{block "content" .}}{{end}}
+    </main>
   </div>
-  <div class="scrim" id="scrim" hidden></div>
-  <script src="/static/folders.js"></script>
-  <script src="/static/app.js"></script>
   <script src="/static/cloud.js"></script>
 </body>
 </html>

@@ -1,155 +1,89 @@
 {{define "content"}}
-<section class="section">
-  <div class="panel" id="cloudRepos">
-    <div class="panel__head">Cloud Repositories</div>
-    <div class="panel__body">
-      {{if not .Cloud.Configured}}
-      <div class="empty">
-        <p class="empty__title">GitHub not configured</p>
-        <p class="empty__body">Set GITSAFE_GITHUB_CLIENT_SECRET and a client id to enable cloud repositories.</p>
-      </div>
-      {{else if not .Cloud.Connected}}
-      <div class="empty">
-        <p class="empty__title">GitHub not connected</p>
-        <p class="empty__body"><a class="btn btn--primary" href="/api/auth/github">Connect GitHub</a></p>
-      </div>
-      {{else}}
-      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-bottom:1rem">
-        <span class="text-sm neutral-weak">Drive:</span>
-        <span class="status status--progress" id="driveStatus">Checking…</span>
-        <span class="text-sm neutral-weak" id="driveDetail" hidden></span>
-      </div>
-      <div class="cloud-loading" id="cloudLoading">Loading repositories…</div>
-      <div class="cloud-error" id="cloudError" hidden></div>
-      <div class="cloud-toolbar" id="cloudToolbar" hidden>
-        <button class="btn btn--primary" id="protectSelectedBtn" type="button" disabled>Protect selected</button>
-        <span class="mono text-sm neutral-weak" id="cloudSelected">Nothing selected</span>
-        <span class="form__flash" id="cloudFlash" hidden></span>
-      </div>
-      <table class="table table--rows" id="cloudTable" hidden>
-        <thead>
-          <tr>
-            <th></th>
-            <th>Repository</th>
-            <th>Default branch</th>
-            <th>Status</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-      <div class="empty" id="cloudEmpty" hidden>
-        <p class="empty__title">No repositories</p>
-        <p class="empty__body">No GitHub repositories were found for this account.</p>
-      </div>
-
-      <div class="panel__head section" style="margin-top:2rem">
-        <div class="cloud-toolbar" style="display:flex;align-items:center;justify-content:space-between;width:100%">
-          <span>Protected</span>
-          <button class="btn" id="backupAllBtn" type="button" disabled>Backup all</button>
-        </div>
-      </div>
-      <table class="table table--rows" id="protectedTable">
-        <thead>
-          <tr>
-            <th>Repository</th>
-            <th>Default branch</th>
-            <th>Protected since</th>
-            <th>Backup</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-      <div class="empty" id="protectedEmpty" hidden>
-        <p class="empty__title">Nothing protected</p>
-        <p class="empty__body">Select repositories above and protect them to begin.</p>
-      </div>
-      <span class="form__flash" id="backupFlash" hidden></span>
-
-      <div class="panel__head section" style="margin-top:2rem">Recent backups</div>
-      <div class="cloud-loading" id="historyLoading" hidden>Loading backups…</div>
-      <table class="table table--rows" id="historyTable">
-        <thead>
-          <tr>
-            <th>Repository</th>
-            <th>Bundle</th>
-            <th>Created</th>
-            <th>Size</th>
-            <th>Status</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-      <div class="empty" id="historyEmpty" hidden>
-        <p class="empty__title">No backups yet</p>
-        <p class="empty__body">Back up a protected repository to create your first bundle.</p>
-      </div>
-
-      <div class="panel__head section" style="margin-top:2rem">Retention &amp; cleanup</div>
-      <p class="text-sm neutral-weak">All fields default to off; nothing is deleted until you enable it. Cleanup never touches a repository with a backup currently running.</p>
-      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
-        <label class="field__label" for="retKeepLocal">Keep local backups</label>
-        <input type="number" class="field__input" id="retKeepLocal" min="0" placeholder="e.g. 10" style="width:6rem">
-        <label class="text-sm neutral-weak" for="retKeepLocal">copies</label>
-        <label class="field__label" for="retKeepDays">or days</label>
-        <input type="number" class="field__input" id="retKeepDays" min="0" placeholder="e.g. 30" style="width:6rem">
-      </div>
-      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
-        <label class="field__label" for="retKeepJobs">Keep job history</label>
-        <input type="number" class="field__input" id="retKeepJobs" min="0" placeholder="e.g. 20" style="width:6rem">
-        <span class="text-sm neutral-weak">entries</span>
-        <label class="field__label" for="retKeepDriveDays">Drive copies older than</label>
-        <input type="number" class="field__input" id="retKeepDriveDays" min="0" placeholder="e.g. 90" style="width:6rem">
-        <span class="text-sm neutral-weak">days</span>
-      </div>
-      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
-        <label class="field__label" for="retDriveEnabled"><input type="checkbox" id="retDriveEnabled"> Delete Drive copies too</label>
-        <span class="text-sm neutral-weak" id="retDriveHint" hidden></span>
-      </div>
-      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
-        <label class="field__label" for="retSchedEnabled"><input type="checkbox" id="retSchedEnabled"> Scheduled cleanup</label>
-        <label class="field__label" for="retSchedDays">every</label>
-        <input type="number" class="field__input" id="retSchedDays" min="1" placeholder="e.g. 7" style="width:6rem">
-        <span class="text-sm neutral-weak">days</span>
-      </div>
-      <div class="text-sm neutral-weak" id="retSchedStatus" style="margin-top:0.5rem"></div>
-      <div class="panel__head section" style="margin-top:2rem">Notifications</div>
-      <p class="text-sm neutral-weak">Receive a cleanup result summary after each run. Nothing is sent until you enable it. The auth token is write-only and is never shown again.</p>
-      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
-        <label class="field__label" for="notifEnabled"><input type="checkbox" id="notifEnabled"> Enable webhook notifications</label>
-      </div>
-      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
-        <label class="field__label" for="notifUrl">Webhook URL</label>
-        <input type="url" class="field__input" id="notifUrl" placeholder="https://hooks.example.com/gitsafe" style="width:26rem">
-        <label class="field__label" for="notifTimeout">Timeout</label>
-        <input type="number" class="field__input" id="notifTimeout" min="1" value="10" style="width:4rem">
-        <span class="text-sm neutral-weak">seconds</span>
-      </div>
-      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
-        <label class="field__label" for="notifAuthHeader">Auth header</label>
-        <input class="field__input" id="notifAuthHeader" placeholder="Authorization" style="width:12rem">
-        <label class="field__label" for="notifAuthToken">Token</label>
-        <input type="password" class="field__input" id="notifAuthToken" placeholder="leave blank to keep" style="width:16rem">
-        <span class="text-sm neutral-weak" id="notifAuthHint" hidden></span>
-      </div>
-      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
-        <button class="btn" id="notifTestBtn" type="button">Send test</button>
-        <span class="form__flash" id="notifFlash" hidden></span>
-      </div>
-      <div class="panel__head section" style="margin-top:2rem">Per-repository overrides</div>
-      <p class="text-sm neutral-weak">Tune retention for individual repositories. Empty fields inherit the global policy; a 0 means "keep all".</p>
-      <div id="overrideList" style="margin-top:1rem"></div>
-      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:0.5rem">
-        <button class="btn" id="overrideAddBtn" type="button">Add override</button>
-      </div>
-      <div class="cloud-toolbar" style="display:flex;align-items:center;gap:1rem;margin-top:1rem">
-        <button class="btn btn--primary" id="retSaveBtn" type="button">Save</button>
-        <button class="btn" id="retRunBtn" type="button">Run cleanup now</button>
-        <span class="form__flash" id="retFlash" hidden></span>
-      </div>
-      <div class="text-sm neutral-weak" id="retResult" style="margin-top:1rem"></div>
-      {{end}}
+{{if not .Cloud.Connected}}
+<div class="onboarding">
+  <section class="hero-card">
+    <div class="hero-card__icon" aria-hidden="true">
+      <svg width="32" height="32" viewBox="0 0 24 24" fill="none">
+        <path d="M12 2.2 20 5.1v5.3c0 4.9-3.3 8.3-8 10-4.7-1.7-8-5.1-8-10V5.1l8-2.9Z"
+              fill="rgba(63,185,80,0.10)" stroke="rgba(63,185,80,0.85)" stroke-width="1.3" stroke-linejoin="round"/>
+        <g transform="translate(4.2 3.2) scale(0.95)">
+          <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"
+                fill="#e6e6ea"/>
+        </g>
+        <circle cx="18" cy="17.8" r="3.1" fill="#3fb950" stroke="#161b22" stroke-width="1.2"/>
+        <path d="M16.7 17.7l.9 1 1.9-2" stroke="#0a0a0b" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
     </div>
-  </div>
-</section>
+    <h1 class="hero-card__title">Back up your repositories</h1>
+    <p class="hero-card__subtitle">Connect your GitHub account to start backing up your cloud repositories to Google Drive.</p>
+    <a class="hero-card__cta" href="/api/auth/github">
+      <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      Connect with GitHub
+    </a>
+    <p class="hero-card__trust">
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 4a4 4 0 0 1 8 0v2h.75c.966 0 1.75.784 1.75 1.75v6.5A1.75 1.75 0 0 1 12.75 16h-9.5A1.75 1.75 0 0 1 1.5 14.25v-6.5C1.5 6.784 2.284 6 3.25 6H4V4Zm1.5 2h5V4a2.5 2.5 0 0 0-5 0v2Zm-2 .5a.25.25 0 0 0-.25.25v6.5c0 .138.112.25.25.25h9.5a.25.25 0 0 0 .25-.25v-6.5a.25.25 0 0 0-.25-.25h-9.5Z"></path></svg>
+      Requires read-only access to repository contents
+    </p>
+  </section>
+</div>
+{{else}}
+<div class="dashboard" id="cloudRepos">
+  <section class="repo-card">
+    <header class="repo-card__head">
+      <h2 class="repo-card__title">Repositories <span class="count-badge" id="repoCount">0</span></h2>
+      <div class="repo-filters" id="repoFilters" role="group" aria-label="Filter repositories">
+        <button class="filter is-active" type="button" data-filter="all">All</button>
+        <button class="filter" type="button" data-filter="backedup">Backed up</button>
+        <button class="filter" type="button" data-filter="notbackedup">Not backed up</button>
+      </div>
+      <span class="repo-card__spacer"></span>
+      <button class="btn btn--primary" id="backupAllBtn" type="button" disabled>Back up all</button>
+      <span class="form__flash form__flash--error" id="flash" hidden></span>
+    </header>
+
+    <div class="cloud-loading" id="cloudLoading">Loading repositories…</div>
+    <div class="cloud-error" id="cloudError" hidden>
+      <span id="cloudErrorText"></span>
+      <button class="btn" id="cloudRetryBtn" type="button">Retry</button>
+    </div>
+    <div class="empty" id="reconnectPanel" hidden>
+      <div class="stack">
+        <p class="empty__title">GitHub connection needs attention</p>
+        <p class="empty__body" id="reconnectText">Your GitHub authorization is no longer valid. Reconnect your account to continue.</p>
+        <a class="btn btn--primary connect-btn" href="/api/auth/github">Reconnect GitHub</a>
+      </div>
+    </div>
+
+    <div class="repo-table" id="repoTable" hidden>
+      <div class="repo-row repo-row--head" aria-hidden="true">
+        <div class="repo-col repo-col--name">Repository</div>
+        <div class="repo-col repo-col--activity">Last activity</div>
+        <div class="repo-col repo-col--status">Backup status</div>
+        <div class="repo-col repo-col--backup">Latest backup</div>
+        <div class="repo-col repo-col--actions"></div>
+      </div>
+      <div id="repoRows"></div>
+    </div>
+    <div class="empty" id="repoEmpty" hidden>
+      <p class="empty__title" id="repoEmptyTitle">No repositories</p>
+      <p class="empty__body" id="repoEmptyBody">No GitHub repositories were found for this account.</p>
+    </div>
+  </section>
+
+  <section class="panel activity-card">
+    <div class="panel__head activity-card__head">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M1.5 2.5A1.5 1.5 0 0 1 3 1h7l4.5 4.5V13a1.5 1.5 0 0 1-1.5 1.5H3A1.5 1.5 0 0 1 1.5 13V2.5ZM10.5 1.5v4h4M4 8.25h5M4 11h3" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Backup activity</span>
+    </div>
+    <div class="panel__body">
+      <div class="backup-activity" id="backupActivityList"></div>
+      <div class="activity-empty" id="backupActivityEmpty">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M1 4.5A1.5 1.5 0 0 1 2.5 3h11A1.5 1.5 0 0 1 15 4.5v7A1.5 1.5 0 0 1 13.5 13h-11A1.5 1.5 0 0 1 1 11.5v-7ZM3 6h.01M5.5 6h.01M8 6h.01M10.5 6h.01M13 6h.01M3 10h8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+        <p class="activity-empty__title">No recent activity</p>
+        <p class="activity-empty__body">Backups you run will stream real-time progress here</p>
+      </div>
+    </div>
+  </section>
+</div>
+{{end}}
 {{end}}
