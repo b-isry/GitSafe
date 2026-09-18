@@ -75,7 +75,9 @@ const (
 // user). The client id may come from the environment variable first, falling
 // back to the configured value (config file), so operators can supply both
 // credentials purely through the environment.
-func GitHubOAuthFromEnv(clientID, redirectURL string) (*GitHubOAuth, bool) {
+// baseURL is the application's base URL (e.g. https://gitsafe.onrender.com or
+// http://127.0.0.1:8080). It is used to construct the GitHub callback URL.
+func GitHubOAuthFromEnv(clientID, baseURL string) (*GitHubOAuth, bool) {
 	if id := os.Getenv(githubClientIDEnv); id != "" {
 		clientID = id
 	}
@@ -83,21 +85,14 @@ func GitHubOAuthFromEnv(clientID, redirectURL string) (*GitHubOAuth, bool) {
 	if clientID == "" || secret == "" {
 		return nil, false
 	}
+	redirectURL := strings.TrimSuffix(baseURL, "/") + "/api/auth/github/callback"
 	oauth := &GitHubOAuth{
 		ClientID:     clientID,
 		ClientSecret: secret,
 		RedirectURL:  redirectURL,
 	}
-	// Absent RedirectURL falls back to the canonical callback below.
-	if oauth.RedirectURL == "" {
-		oauth.RedirectURL = oauthRedirectURL
-	}
 	return oauth, true
 }
-
-// oauthRedirectURL is the local callback the browser hits after GitHub returns.
-// The server binds 127.0.0.1, so the callback uses the loopback address.
-const oauthRedirectURL = "http://127.0.0.1:8080/api/auth/github/callback"
 
 func (s *Server) githubClientFor(token string) providers.Client {
 	return providers.NewGitHubProvider(token)

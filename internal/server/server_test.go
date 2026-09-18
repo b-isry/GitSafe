@@ -46,7 +46,7 @@ func TestHomePageIsCloudRepositories(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"Cloud Repositories", "Back up your repositories", "Connect with GitHub"} {
+	for _, want := range []string{"GitSafe", "Back up your repositories", "Connect with GitHub"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("home page missing %q", want)
 		}
@@ -77,7 +77,7 @@ func TestHomePageHasNoSettingsRoute(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s /settings status = %d, want 200 (catch-all)", meth, rec.Code)
 		}
-		if body := rec.Body.String(); !strings.Contains(body, "Cloud Repositories") {
+		if body := rec.Body.String(); !strings.Contains(body, "GitSafe") {
 			t.Fatalf("%s /settings did not fall through to the cloud page", meth)
 		}
 	}

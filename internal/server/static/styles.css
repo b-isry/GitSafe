@@ -119,12 +119,10 @@ a { color: inherit; text-decoration: none; }
   border-radius: var(--radius-sm);
 }
 .brand__mark {
-  width: 14px;
-  height: 14px;
-  border-radius: var(--radius-sm);
-  background: var(--accent-dim);
-  border: 1px solid var(--accent);
-  box-shadow: 0 0 10px rgba(63, 185, 80, 0.25);
+  width: 28px;
+  height: 28px;
+  color: var(--accent);
+  flex-shrink: 0;
 }
 .brand__name {
   font-weight: 600;

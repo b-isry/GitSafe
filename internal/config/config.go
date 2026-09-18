@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"gopkg.in/yaml.v3"
@@ -41,6 +42,7 @@ type Config struct {
 	Cloud      CloudConfig      `yaml:"cloud"`
 	GitHub     GitHubConfig     `yaml:"github,omitempty"`
 	DriveOAuth DriveOAuthConfig `yaml:"driveOAuth,omitempty"`
+	BaseURL    string           `yaml:"baseUrl,omitempty"`
 }
 
 func Defaults() Config {
@@ -159,4 +161,15 @@ func (c Config) Validate() error {
 func (c *Config) expandEnv() {
 	c.OutputPath = os.ExpandEnv(c.OutputPath)
 	c.Cloud.CredentialsFile = os.ExpandEnv(c.Cloud.CredentialsFile)
+	c.BaseURL = os.ExpandEnv(c.BaseURL)
+}
+
+// BaseURLOrDefault returns the configured base URL, defaulting to the local
+// development address. The URL must include the scheme (http/https) and
+// should not have a trailing slash.
+func (c *Config) BaseURLOrDefault() string {
+	if c.BaseURL != "" {
+		return strings.TrimSuffix(c.BaseURL, "/")
+	}
+	return "http://127.0.0.1:8080"
 }

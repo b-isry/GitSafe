@@ -61,13 +61,14 @@ func main() {
 		logger.Error("failed to open state store", "error", err)
 		os.Exit(1)
 	}
+	baseURL := cfg.BaseURLOrDefault()
 	var oauth *server.GitHubOAuth
-	if gh, ok := server.GitHubOAuthFromEnv(cfg.GitHub.ClientID, cfg.GitHub.RedirectURL); ok {
+	if gh, ok := server.GitHubOAuthFromEnv(cfg.GitHub.ClientID, baseURL); ok {
 		oauth = gh
 		logger.Info("github oauth configured")
 	}
 	var driveOAuth *server.DriveOAuth
-	if d, ok := server.DriveOAuthFromEnv(cfg.DriveOAuth.ClientID, cfg.DriveOAuth.RedirectURL); ok {
+	if d, ok := server.DriveOAuthFromEnv(cfg.DriveOAuth.ClientID, baseURL); ok {
 		driveOAuth = d
 		logger.Info("drive oauth configured")
 	}

@@ -138,3 +138,39 @@ func TestConfigValidateRequiresOutputPath(t *testing.T) {
 		t.Fatal("expected validation error for empty outputPath")
 	}
 }
+
+func TestConfigBaseURLOrDefault(t *testing.T) {
+	t.Run("defaults to local when empty", func(t *testing.T) {
+		cfg := Defaults()
+		cfg.BaseURL = ""
+		if got := cfg.BaseURLOrDefault(); got != "http://127.0.0.1:8080" {
+			t.Fatalf("BaseURLOrDefault = %q, want %q", got, "http://127.0.0.1:8080")
+		}
+	})
+
+	t.Run("uses configured value", func(t *testing.T) {
+		cfg := Defaults()
+		cfg.BaseURL = "https://gitsafe.example.com"
+		if got := cfg.BaseURLOrDefault(); got != "https://gitsafe.example.com" {
+			t.Fatalf("BaseURLOrDefault = %q, want %q", got, "https://gitsafe.example.com")
+		}
+	})
+
+	t.Run("strips trailing slash", func(t *testing.T) {
+		cfg := Defaults()
+		cfg.BaseURL = "https://gitsafe.example.com/"
+		if got := cfg.BaseURLOrDefault(); got != "https://gitsafe.example.com" {
+			t.Fatalf("BaseURLOrDefault = %q, want %q", got, "https://gitsafe.example.com")
+		}
+	})
+
+	t.Run("expands environment variable", func(t *testing.T) {
+		t.Setenv("GITSAFE_BASE_URL", "https://from-env.example.com")
+		cfg := Defaults()
+		cfg.BaseURL = "${GITSAFE_BASE_URL}"
+		cfg.expandEnv()
+		if got := cfg.BaseURLOrDefault(); got != "https://from-env.example.com" {
+			t.Fatalf("BaseURLOrDefault = %q, want %q", got, "https://from-env.example.com")
+		}
+	})
+}

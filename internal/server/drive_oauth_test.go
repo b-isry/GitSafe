@@ -238,3 +238,71 @@ func requestWithCSRF(t *testing.T, s *Server, method, path string, cookie *http.
 	s.Routes().ServeHTTP(rec, req)
 	return rec
 }
+
+// TestDriveOAuthFromEnvCallbackURL verifies the Drive OAuth callback URL is
+// constructed from the provided base URL.
+func TestDriveOAuthFromEnvCallbackURL(t *testing.T) {
+	t.Setenv(driveClientIDEnv, "")
+	t.Setenv(driveClientSecretEnv, "")
+
+	t.Run("defaults to local when empty", func(t *testing.T) {
+		t.Setenv(driveClientIDEnv, "")
+		t.Setenv(driveClientSecretEnv, "secret")
+		// Pass a clientID in the argument since env var is empty
+		oauth, ok := DriveOAuthFromEnv("test-client", "http://127.0.0.1:8080")
+		if !ok {
+			t.Fatal("expected configured")
+		}
+		if oauth.RedirectURL != "http://127.0.0.1:8080/api/auth/drive/callback" {
+			t.Fatalf("RedirectURL = %q, want %q", oauth.RedirectURL, "http://127.0.0.1:8080/api/auth/drive/callback")
+		}
+	})
+
+	t.Run("uses production base URL", func(t *testing.T) {
+		t.Setenv(driveClientIDEnv, "prod-client")
+		t.Setenv(driveClientSecretEnv, "prod-secret")
+		oauth, ok := DriveOAuthFromEnv("", "https://gitsafe.onrender.com")
+		if !ok {
+			t.Fatal("expected configured")
+		}
+		if oauth.RedirectURL != "https://gitsafe.onrender.com/api/auth/drive/callback" {
+			t.Fatalf("RedirectURL = %q, want %q", oauth.RedirectURL, "https://gitsafe.onrender.com/api/auth/drive/callback")
+		}
+		// Ensure no accidental 127.0.0.1
+		if strings.Contains(oauth.RedirectURL, "127.0.0.1") {
+			t.Fatalf("RedirectURL must not contain 127.0.0.1: %q", oauth.RedirectURL)
+		}
+	})
+
+	t.Run("strips trailing slash from base URL", func(t *testing.T) {
+		t.Setenv(driveClientIDEnv, "client")
+		t.Setenv(driveClientSecretEnv, "secret")
+		oauth, ok := DriveOAuthFromEnv("", "https://example.com/")
+		if !ok {
+			t.Fatal("expected configured")
+		}
+		if oauth.RedirectURL != "https://example.com/api/auth/drive/callback" {
+			t.Fatalf("RedirectURL = %q, want %q", oauth.RedirectURL, "https://example.com/api/auth/drive/callback")
+		}
+	})
+
+	t.Run("env takes precedence for client id", func(t *testing.T) {
+		t.Setenv(driveClientIDEnv, "env-client")
+		t.Setenv(driveClientSecretEnv, "env-secret")
+		oauth, ok := DriveOAuthFromEnv("config-client", "http://127.0.0.1:8080")
+		if !ok {
+			t.Fatal("expected configured")
+		}
+		if oauth.ClientID != "env-client" {
+			t.Fatalf("ClientID = %q, want env-client", oauth.ClientID)
+		}
+	})
+
+	t.Run("requires client secret from env", func(t *testing.T) {
+		t.Setenv(driveClientIDEnv, "client")
+		t.Setenv(driveClientSecretEnv, "")
+		if _, ok := DriveOAuthFromEnv("client", "http://127.0.0.1:8080"); ok {
+			t.Fatal("missing secret must yield unconfigured")
+		}
+	})
+}

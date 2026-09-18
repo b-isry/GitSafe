@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/b-isry/gitsafe/internal/cloud"
@@ -35,17 +36,14 @@ const (
 	driveClientIDEnv = "GITSAFE_DRIVE_CLIENT_ID"
 )
 
-// driveOAuthRedirectURL is the local callback the browser hits after Google
-// returns. The server binds 127.0.0.1, so the callback uses the loopback
-// address (explicitly allowed by Google for non-HTTPS OAuth).
-const driveOAuthRedirectURL = "http://127.0.0.1:8080/api/auth/drive/callback"
-
 // DriveOAuthFromEnv returns the OAuth configuration from non-secret settings
 // and the client secret read from the environment. Returns (nil, false) when
 // the server should run without a Google Drive connection (appearing simply
 // not connected to the user). The client id may come from the environment
 // variable first, falling back to the configured value (config file).
-func DriveOAuthFromEnv(clientID, redirectURL string) (*DriveOAuth, bool) {
+// baseURL is the application's base URL (e.g. https://gitsafe.onrender.com or
+// http://127.0.0.1:8080). It is used to construct the Drive callback URL.
+func DriveOAuthFromEnv(clientID, baseURL string) (*DriveOAuth, bool) {
 	if id := os.Getenv(driveClientIDEnv); id != "" {
 		clientID = id
 	}
@@ -53,13 +51,11 @@ func DriveOAuthFromEnv(clientID, redirectURL string) (*DriveOAuth, bool) {
 	if clientID == "" || secret == "" {
 		return nil, false
 	}
+	redirectURL := strings.TrimSuffix(baseURL, "/") + "/api/auth/drive/callback"
 	oauth := &DriveOAuth{
 		ClientID:     clientID,
 		ClientSecret: secret,
 		RedirectURL:  redirectURL,
-	}
-	if oauth.RedirectURL == "" {
-		oauth.RedirectURL = driveOAuthRedirectURL
 	}
 	return oauth, true
 }

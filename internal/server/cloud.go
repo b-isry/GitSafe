@@ -12,7 +12,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// cloudRepositoriesPage is the template key for the "Cloud Repositories" page.
+// cloudRepositoriesPage is the template key for the GitSafe page.
 const cloudRepositoriesPage = "cloud-repositories"
 
 // handleCloudRepositories renders the page that lets the user discover GitHub
@@ -30,7 +30,7 @@ func (s *Server) handleCloudRepositories(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	s.render(w, cloudRepositoriesPage, renderData{
-		pageData: pageData{Active: "cloud-repositories", PageTitle: "Cloud Repositories"},
+		pageData: pageData{Active: "cloud-repositories", PageTitle: "GitSafe"},
 		Cloud:    view,
 	})
 }

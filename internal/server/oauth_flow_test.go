@@ -153,7 +153,7 @@ func TestGitHubCallbackUnavailableIsGraceful(t *testing.T) {
 func TestGitHubLoginRedirectsOnlyToGitHub(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), &GitHubOAuth{
 		ClientID: "gh-client", ClientSecret: "supersecret",
-		RedirectURL: oauthRedirectURL,
+		RedirectURL: "http://127.0.0.1:8080/api/auth/github/callback",
 	})
 	rec := request(t, s, http.MethodGet, "/api/auth/github", nil)
 	if rec.Code != http.StatusFound {
@@ -402,25 +402,34 @@ func TestGitHubDisconnectWithoutRevoker(t *testing.T) {
 // TestGitHubOAuthFromEnvClientID verifies the client id can come from the
 // environment (deployment-level) rather than only the config file.
 func TestGitHubOAuthFromEnvClientID(t *testing.T) {
+	baseURL := "http://127.0.0.1:8080"
 	t.Setenv(githubClientIDEnv, "")
 	t.Setenv(githubClientSecretEnv, "")
-	if gh, ok := GitHubOAuthFromEnv("", oauthRedirectURL); ok || gh != nil {
+	gh, ok := GitHubOAuthFromEnv("", baseURL)
+	if ok || gh != nil {
 		t.Fatalf("no credentials must yield unconfigured, got %+v", gh)
 	}
 
 	t.Setenv(githubClientIDEnv, "env-client")
 	t.Setenv(githubClientSecretEnv, "env-secret")
-	if gh, ok := GitHubOAuthFromEnv("", oauthRedirectURL); !ok || gh.ClientID != "env-client" {
+	gh, ok = GitHubOAuthFromEnv("", baseURL)
+	if !ok || gh.ClientID != "env-client" {
 		t.Fatalf("client id from env not used: %+v", gh)
+	}
+	if gh.RedirectURL != baseURL+"/api/auth/github/callback" {
+		t.Fatalf("RedirectURL = %q, want %q", gh.RedirectURL, baseURL+"/api/auth/github/callback")
 	}
 
 	t.Setenv(githubClientIDEnv, "")
 	t.Setenv(githubClientSecretEnv, "env-secret")
-	gh, ok := GitHubOAuthFromEnv("cfg-client", oauthRedirectURL)
+	gh, ok = GitHubOAuthFromEnv("cfg-client", baseURL)
 	if !ok || gh.ClientID != "cfg-client" {
 		t.Fatalf("config client id should be the fallback: %+v", gh)
 	}
 	if gh.ClientSecret != "env-secret" {
 		t.Fatalf("client secret not read from env: %+v", gh)
+	}
+	if gh.RedirectURL != baseURL+"/api/auth/github/callback" {
+		t.Fatalf("RedirectURL = %q, want %q", gh.RedirectURL, baseURL+"/api/auth/github/callback")
 	}
 }

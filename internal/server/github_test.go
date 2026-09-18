@@ -292,11 +292,12 @@ func TestGitHubOAuthFromEnvSourcesClientID(t *testing.T) {
 	// Start clean so ambient CI env vars cannot influence the result.
 	t.Setenv(githubClientIDEnv, "")
 	t.Setenv(githubClientSecretEnv, "")
+	baseURL := "http://127.0.0.1:8080"
 
 	t.Run("config only", func(t *testing.T) {
 		t.Setenv(githubClientIDEnv, "")
 		t.Setenv(githubClientSecretEnv, "cfg-secret")
-		gh, ok := GitHubOAuthFromEnv("cfg-client", oauthRedirectURL)
+		gh, ok := GitHubOAuthFromEnv("cfg-client", baseURL)
 		if !ok {
 			t.Fatal("config client id with env secret must configure")
 		}
@@ -306,47 +307,57 @@ func TestGitHubOAuthFromEnvSourcesClientID(t *testing.T) {
 		if gh.ClientSecret != "cfg-secret" {
 			t.Fatalf("ClientSecret = %q, want %q", gh.ClientSecret, "cfg-secret")
 		}
+		if gh.RedirectURL != baseURL+"/api/auth/github/callback" {
+			t.Fatalf("RedirectURL = %q, want %q", gh.RedirectURL, baseURL+"/api/auth/github/callback")
+		}
 	})
 
 	t.Run("env only", func(t *testing.T) {
 		t.Setenv(githubClientIDEnv, "env-client")
 		t.Setenv(githubClientSecretEnv, "env-secret")
-		gh, ok := GitHubOAuthFromEnv("", oauthRedirectURL)
+		gh, ok := GitHubOAuthFromEnv("", baseURL)
 		if !ok {
 			t.Fatal("env client id with env secret must configure")
 		}
 		if gh.ClientID != "env-client" {
 			t.Fatalf("ClientID = %q, want %q", gh.ClientID, "env-client")
 		}
+		if gh.RedirectURL != baseURL+"/api/auth/github/callback" {
+			t.Fatalf("RedirectURL = %q, want %q", gh.RedirectURL, baseURL+"/api/auth/github/callback")
+		}
 	})
 
 	t.Run("env takes precedence over config", func(t *testing.T) {
 		t.Setenv(githubClientIDEnv, "env-client")
 		t.Setenv(githubClientSecretEnv, "env-secret")
-		gh, ok := GitHubOAuthFromEnv("cfg-client", oauthRedirectURL)
+		gh, ok := GitHubOAuthFromEnv("cfg-client", baseURL)
 		if !ok {
 			t.Fatal("both sources set must configure")
 		}
 		if gh.ClientID != "env-client" {
 			t.Fatalf("ClientID = %q, want env-client to win", gh.ClientID)
 		}
+		if gh.RedirectURL != baseURL+"/api/auth/github/callback" {
+			t.Fatalf("RedirectURL = %q, want %q", gh.RedirectURL, baseURL+"/api/auth/github/callback")
+		}
 	})
 
 	t.Run("both empty", func(t *testing.T) {
 		t.Setenv(githubClientIDEnv, "")
 		t.Setenv(githubClientSecretEnv, "")
-		if gh, ok := GitHubOAuthFromEnv("", oauthRedirectURL); ok || gh != nil {
+		if gh, ok := GitHubOAuthFromEnv("", baseURL); ok || gh != nil {
 			t.Fatalf("no credentials must yield unconfigured, got %+v", gh)
 		}
 	})
 }
 
 func TestGitHubOAuthFromEnvClientSecretRequired(t *testing.T) {
+	baseURL := "http://127.0.0.1:8080"
 	t.Setenv(githubClientIDEnv, "")
 	t.Setenv(githubClientSecretEnv, "")
 	// A client id without a secret is not enough — the secret must always come
 	// from the environment, matching the pre-existing behavior.
-	if gh, ok := GitHubOAuthFromEnv("cfg-client", oauthRedirectURL); ok || gh != nil {
+	if gh, ok := GitHubOAuthFromEnv("cfg-client", baseURL); ok || gh != nil {
 		t.Fatalf("missing client secret must yield unconfigured, got %+v", gh)
 	}
 }
