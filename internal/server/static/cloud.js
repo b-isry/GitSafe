@@ -206,8 +206,7 @@
   function actionsCell(repo) {
     var wrap = el("div", "repo-col repo-col--actions repo-actions");
     if (repo.backedUp) {
-      // The primary action for a backed-up repository is opening the real Drive
-      // destination of its latest successful backup.
+      var stack = el("div", "repo-actions__stack");
       if (repo.latestBackup && repo.latestBackup.driveViewLink) {
         var link = document.createElement("a");
         link.className = "btn btn--primary";
@@ -215,12 +214,13 @@
         link.target = "_blank";
         link.rel = "noopener";
         link.textContent = "View in Drive";
-        wrap.appendChild(link);
+        stack.appendChild(link);
       }
       var backupNow = el("button", "btn", "Backup Now");
       backupNow.type = "button";
       backupNow.addEventListener("click", function () { backupRepo(repo, backupNow); });
-      wrap.appendChild(backupNow);
+      stack.appendChild(backupNow);
+      wrap.appendChild(stack);
       return wrap;
     }
     var backupBtn = el("button", "btn btn--primary", "Back up");

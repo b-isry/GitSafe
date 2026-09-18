@@ -3,3 +3,4 @@ backups/
 /bin/
 DESIGN.md
 .env
+.gitsafe/

@@ -74,7 +74,11 @@ func main() {
 	srv.ConfigureCloud(stateStore, tokenstore.New(), oauth)
 	srv.ConfigureDriveOAuth(driveOAuth)
 
-	addr := "127.0.0.1:8080"
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	addr := ":" + port
 	httpSrv := &http.Server{
 		Addr:    addr,
 		Handler: srv.Routes(),
