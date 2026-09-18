@@ -3,6 +3,7 @@ package githuboauth
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -143,5 +144,82 @@ func TestExchangeUnexpectedErrorField(t *testing.T) {
 	c := testClient(Config{ClientID: "id", ClientSecret: "s"}, srv.URL, srv.Client())
 	if _, _, err := c.Exchange(context.Background(), "code"); err == nil {
 		t.Fatal("expected error for API error field")
+	}
+}
+
+func TestRevokeSuccess(t *testing.T) {
+	var gotAuth, gotBody string
+	var gotMethod, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(Config{ClientID: "gh-client", ClientSecret: "shh"}, "", srv.Client())
+	c.apiBase = srv.URL
+	if err := c.Revoke(context.Background(), "tok-abc"); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	if gotMethod != http.MethodDelete {
+		t.Errorf("method = %s, want DELETE", gotMethod)
+	}
+	if want := "/applications/gh-client/token"; gotPath != want {
+		t.Errorf("path = %q, want %q", gotPath, want)
+	}
+	if !strings.HasPrefix(gotAuth, "Basic ") {
+		t.Errorf("revoke must authenticate with the app's credentials (Basic auth), got %q", gotAuth)
+	}
+	// The token value must appear in the body, never a client secret.
+	if !strings.Contains(gotBody, "tok-abc") {
+		t.Errorf("revoke body missing token: %q", gotBody)
+	}
+	if strings.Contains(gotBody, "shh") || strings.Contains(gotAuth, "shh") {
+		t.Errorf("revoke must not expose the client secret: body=%q auth=%q", gotBody, gotAuth)
+	}
+}
+
+func TestRevokeNotFoundIsSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(Config{ClientID: "id", ClientSecret: "s"}, "", srv.Client())
+	c.apiBase = srv.URL
+	if err := c.Revoke(context.Background(), "tok"); err != nil {
+		t.Fatalf("Revoke on 404 should succeed (already gone): %v", err)
+	}
+}
+
+func TestRevokeServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(Config{ClientID: "id", ClientSecret: "s"}, "", srv.Client())
+	c.apiBase = srv.URL
+	if err := c.Revoke(context.Background(), "tok"); err == nil {
+		t.Fatal("expected error for 500")
+	}
+}
+
+func TestRevokeEmptyToken(t *testing.T) {
+	c := testClient(Config{ClientID: "id", ClientSecret: "s"}, "", nil)
+	if err := c.Revoke(context.Background(), ""); err == nil {
+		t.Fatal("expected error for empty token")
+	}
+}
+
+func TestRevokeNetworkError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+	c := testClient(Config{ClientID: "id", ClientSecret: "s"}, "", &http.Client{Timeout: 2 * time.Second})
+	c.apiBase = url
+	if err := c.Revoke(context.Background(), "tok"); err == nil {
+		t.Fatal("expected network error")
 	}
 }

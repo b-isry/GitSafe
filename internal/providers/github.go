@@ -105,7 +105,7 @@ func (g *GitHubProvider) ListRepositories(ctx context.Context) ([]Repository, er
 	page := 1
 	for {
 		endpoint := fmt.Sprintf(
-			"/user/repos?affiliation=owner,collaborator,organization_member&type=all&per_page=100&page=%d",
+			"/user/repos?affiliation=owner,collaborator,organization_member&per_page=100&page=%d",
 			page)
 
 		var pageRepos []repoResponse

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -106,6 +107,35 @@ func TestListRepositoriesPagination(t *testing.T) {
 	}
 	if pageRequests != 3 {
 		t.Fatalf("pageRequests = %d, want 3", pageRequests)
+	}
+}
+
+func TestListRepositoriesNoTypeQuery(t *testing.T) {
+	var gotURL string
+	srv := tsHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.String()
+		w.Header().Set("Link", "")
+		writeJSONStatus(w, http.StatusOK, []any{
+			repoJSON(1, "a/b", false),
+		})
+	})
+	g := newGitHubProvider("tok", srv.URL, srv.Client())
+	if _, err := g.ListRepositories(context.Background()); err != nil {
+		t.Fatalf("ListRepositories: %v", err)
+	}
+	u, err := url.Parse(gotURL)
+	if err != nil {
+		t.Fatalf("parse captured URL %q: %v", gotURL, err)
+	}
+	q := u.Query()
+	if got := q.Get("type"); got != "" {
+		t.Fatalf("request URL %q carries type=%q; GitHub rejects type with affiliation (422). Drop it.", gotURL, got)
+	}
+	if got := q.Get("affiliation"); got != "owner,collaborator,organization_member" {
+		t.Fatalf("affiliation = %q, want owner,collaborator,organization_member", got)
+	}
+	if got := q.Get("per_page"); got != "100" {
+		t.Fatalf("per_page = %q, want 100", got)
 	}
 }
 
