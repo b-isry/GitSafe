@@ -360,30 +360,6 @@ func (s *Store) AddBackupRecord(rec BackupRecord) {
 	s.doc.BackupRecords = append(s.doc.BackupRecords, rec)
 }
 
-func (s *Store) UpdateBackupRecord(rec BackupRecord) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i := range s.doc.BackupRecords {
-		if s.doc.BackupRecords[i].ID == rec.ID {
-			s.doc.BackupRecords[i] = rec
-			return nil
-		}
-	}
-	return fmt.Errorf("%w: backup record %q", ErrNotFound, rec.ID)
-}
-
-func (s *Store) RemoveBackupRecord(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i := range s.doc.BackupRecords {
-		if s.doc.BackupRecords[i].ID == id {
-			s.doc.BackupRecords = append(s.doc.BackupRecords[:i], s.doc.BackupRecords[i+1:]...)
-			return nil
-		}
-	}
-	return fmt.Errorf("%w: backup record %q", ErrNotFound, id)
-}
-
 func (s *Store) BackupRecords() []BackupRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

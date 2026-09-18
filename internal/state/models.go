@@ -49,9 +49,6 @@ func IsTerminalState(state string) bool {
 
 // Backup record terminal outcomes recorded on BackupRecord.Status.
 const (
-	// BackupStatusBundled means the bundle was written locally but not uploaded
-	// to Drive (Drive disabled/not configured, or an upload that later failed).
-	BackupStatusBundled = "bundled"
 	// BackupStatusUploaded means the bundle was written locally and uploaded to
 	// Drive; BackupRecord.DriveFileID is set.
 	BackupStatusUploaded = "uploaded"

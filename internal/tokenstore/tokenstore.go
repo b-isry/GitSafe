@@ -29,6 +29,10 @@ const Service = "gitsafe"
 const (
 	// GitHubToken is the token reference for the connected GitHub account.
 	GitHubToken = "github.primary"
+	// DriveToken is the token reference for the connected Google Drive account.
+	// It stores the OAuth refresh token, from which fresh access tokens are
+	// minted on demand for detached backup work.
+	DriveToken = "drive.primary"
 )
 
 // ErrNotFound is returned when no token exists for the given reference.

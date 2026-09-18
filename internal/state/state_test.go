@@ -220,7 +220,7 @@ func TestBackupJobRemove(t *testing.T) {
 	}
 }
 
-func TestBackupRecordRemove(t *testing.T) {
+func TestBackupRecordAddAndList(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	s, _ := Open(path)
 	r1 := testRecord("repo-a")
@@ -230,17 +230,8 @@ func TestBackupRecordRemove(t *testing.T) {
 	s.AddBackupRecord(r1)
 	s.AddBackupRecord(r2)
 
-	if err := s.RemoveBackupRecord("rec-1"); err != nil {
-		t.Fatalf("RemoveBackupRecord failed: %v", err)
-	}
-	if len(s.BackupRecords()) != 1 {
+	if len(s.BackupRecords()) != 2 {
 		t.Fatalf("records = %+v", s.BackupRecords())
-	}
-	if s.BackupRecords()[0].ID != "rec-2" {
-		t.Fatalf("wrong record survived: %+v", s.BackupRecords()[0])
-	}
-	if err := s.RemoveBackupRecord("missing"); err == nil {
-		t.Fatal("RemoveBackupRecord(missing) should error")
 	}
 }
 

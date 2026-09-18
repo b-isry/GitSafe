@@ -10,15 +10,21 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/b-isry/gitsafe/internal/backup"
 	"github.com/b-isry/gitsafe/internal/config"
 	"github.com/b-isry/gitsafe/internal/server"
 	"github.com/b-isry/gitsafe/internal/state"
 	"github.com/b-isry/gitsafe/internal/tokenstore"
+	"github.com/joho/godotenv"
 )
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	// Load the optional .env file first so deployment-level values (the GitHub
+	// OAuth client id/secret) are set before config is read and expanded.
+	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
+		logger.Warn("failed to load .env", "error", err)
+	}
 
 	cfg, err := config.Load("config.yaml")
 	if err != nil {
@@ -27,8 +33,8 @@ func main() {
 	}
 
 	// Resolve the output path to an absolute directory up front. Backups run git
-	// with `-C <repo>`, which would resolve a relative path against each
-	// repository rather than the server working directory.
+	// with `-C <mirror>`, so a relative path would be resolved against the server
+	// working directory rather than the expected bundle location.
 	if abs, err := filepath.Abs(cfg.OutputPath); err == nil {
 		cfg.OutputPath = abs
 	}
@@ -39,15 +45,11 @@ func main() {
 	}
 
 	app := &server.App{
-		Logger:     logger,
 		Config:     cfg,
-		Runner:     backup.New(logger),
 		OutputPath: cfg.OutputPath,
-		Threshold:  cfg.Days,
 	}
 
-	store := server.NewBackupStore(logger)
-	srv, err := server.New(logger, app, store, "config.yaml")
+	srv, err := server.New(logger, app, "config.yaml")
 	if err != nil {
 		logger.Error("failed to create server", "error", err)
 		os.Exit(1)
@@ -64,9 +66,13 @@ func main() {
 		oauth = gh
 		logger.Info("github oauth configured")
 	}
+	var driveOAuth *server.DriveOAuth
+	if d, ok := server.DriveOAuthFromEnv(cfg.DriveOAuth.ClientID, cfg.DriveOAuth.RedirectURL); ok {
+		driveOAuth = d
+		logger.Info("drive oauth configured")
+	}
 	srv.ConfigureCloud(stateStore, tokenstore.New(), oauth)
-	// Schedule periodic retention cleanup when the config enables it.
-	srv.StartCleanupScheduler()
+	srv.ConfigureDriveOAuth(driveOAuth)
 
 	addr := "127.0.0.1:8080"
 	httpSrv := &http.Server{
@@ -74,9 +80,8 @@ func main() {
 		Handler: srv.Routes(),
 	}
 
-	// Graceful shutdown: on interrupt, stop accepting connections, let any
-	// in-flight requests finish, and stop the cleanup scheduler cleanly so no
-	// goroutine is leaked and the process never hangs.
+	// Graceful shutdown: on interrupt, stop accepting connections and let any
+	// in-flight requests finish so the process never hangs.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	go func() {
@@ -94,6 +99,5 @@ func main() {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
-	srv.StopCleanupScheduler()
 	logger.Info("gitsafe web stopped")
 }
