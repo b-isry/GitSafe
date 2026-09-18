@@ -11,11 +11,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/b-isry/gitsafe/internal/archiver"
-	"github.com/b-isry/gitsafe/internal/cloud"
-	"github.com/b-isry/gitsafe/internal/config"
+	"github.com/b-isry/gitsafe/internal/providers"
 	"github.com/b-isry/gitsafe/internal/state"
 	"github.com/google/uuid"
 )
@@ -74,33 +74,13 @@ func sha256File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// driveUploadFunc uploads a completed local bundle to Google Drive and returns
-// the created Drive file ID. It keeps the cloud package out of the job
-// orchestration so tests can stub the network/Google work.
-type driveUploadFunc func(ctx context.Context, bundlePath string, cloudCfg config.CloudConfig, logger *slog.Logger) (string, error)
-
-// defaultDriveUpload uploads a bundle to Drive using the configured service
-// account and returns the new Drive file ID.
-func defaultDriveUpload(ctx context.Context, bundlePath string, cloudCfg config.CloudConfig, logger *slog.Logger) (string, error) {
-	return cloud.UploadFile(ctx, cloudCfg, bundlePath, logger, nil)
-}
-
-// driveDeleteFunc deletes a Drive file by ID using the configured service
-// account, returning nil only when Drive confirms the deletion.
-type driveDeleteFunc func(ctx context.Context, fileID string, cloudCfg config.CloudConfig, logger *slog.Logger) error
-
-// defaultDriveDelete removes a Drive file by ID. It returns nil only on a
-// provider-confirmed success; used by retention cleanup for IDs GitSafe itself
-// recorded.
-func defaultDriveDelete(ctx context.Context, fileID string, cloudCfg config.CloudConfig, logger *slog.Logger) error {
-	return cloud.DeleteFile(ctx, cloudCfg, fileID, logger)
-}
-
-// driveEnabledFor reports whether Drive upload is enabled for a given cloud
-// configuration snapshot.
-func driveEnabledFor(cfg config.CloudConfig) bool {
-	return cfg.Enabled && cfg.CredentialsFile != ""
-}
+// driveUploadFunc uploads a completed local bundle to the connected Google
+// Drive account and returns the created Drive file ID. folderID is the GitSafe
+// storage folder in the connected account; driveToken is the stored OAuth
+// refresh token (never persisted to state). Real byte progress is reported
+// through onProgress (nil is allowed). It keeps the cloud package out of the
+// job orchestration so tests can stub the network/Google work.
+type driveUploadFunc func(ctx context.Context, bundlePath, folderID, driveToken string, onProgress func(now, total int64), logger *slog.Logger) (string, error)
 
 // sanitizeMessage strips credentials from a message before it is persisted or
 // returned to the client. It guards against any code path leaking a tokenized
@@ -130,6 +110,12 @@ func (s *Server) startProtectedBackup(protectedRepoID string) (state.BackupJob, 
 		if j.ProtectedRepoID == protectedRepoID {
 			return state.BackupJob{}, errJobInFlight
 		}
+	}
+
+	// Drive is the only valid backup destination. Fail at request time with a
+	// clear message when no Google Drive account is connected.
+	if !s.driveConnected() {
+		return state.BackupJob{}, errDriveNotConnected
 	}
 
 	now := time.Now()
@@ -177,11 +163,6 @@ func (s *Server) runProtectedBackup(jobID string, repo state.ProtectedRepo) {
 	ctx := context.Background()
 	bg := s.logger
 
-	// Snapshot the configuration once under the app lock so this detached
-	// goroutine is insulated from a concurrent settings save and reads a stable
-	// output path and cloud config for the whole run.
-	cfg := s.app.ConfigSnapshot()
-
 	getJob := func() state.BackupJob {
 		j, _ := s.stateStore.BackupJob(jobID)
 		return j
@@ -209,15 +190,62 @@ func (s *Server) runProtectedBackup(jobID string, repo state.ProtectedRepo) {
 		return
 	}
 
+	// Google Drive is the only valid backup destination: without a connected
+	// account a backup cannot complete. Re-checked here (in addition to the
+	// request-time check) so a disconnect mid-flight fails cleanly too.
+	driveConn, ok := s.driveConnection()
+	if !ok {
+		s.finishProtectedJob(jobID, repo, errDriveNotConnected.Error()+". Connect your Google account and try again.")
+		return
+	}
+	refreshToken, err := s.tokenStore.Get(driveConn.TokenRef)
+	if err != nil || refreshToken == "" {
+		s.finishProtectedJob(jobID, repo, "Google Drive access token is unavailable. Reconnect your account and try again.")
+		return
+	}
+
+	// Stage the bundle in a temporary directory so no permanent local copy
+	// survives a finished backup. The temporary directory is always removed.
+	staging, err := os.MkdirTemp("", "gitsafe-staging-*")
+	if err != nil {
+		s.finishProtectedJob(jobID, repo, "could not create a temporary staging directory")
+		return
+	}
+	defer os.RemoveAll(staging)
+
 	setState(state.JobCloning)
-	outcome, err := s.bundleBackup(ctx, repo.FullName, token, cfg.OutputPath)
+	outcome, err := s.bundleBackup(ctx, repo.FullName, token, staging)
 	if err != nil {
 		bg.Error("protected backup failed", "job", jobID, "repo", repo.FullName, "error", err)
 		s.finishProtectedJob(jobID, repo, "backup failed: "+err.Error())
 		return
 	}
-	setState(state.JobBundling)
 
+	setState(state.JobUploading)
+	s.setJobProgress(jobID, jobProgressMetrics{UploadedBytes: 0, TotalBytes: outcome.SizeBytes})
+	driveID, err := s.driveUpload(ctx, outcome.BundlePath, driveConn.StorageFolderID, refreshToken, func(now, total int64) {
+		s.setJobProgress(jobID, jobProgressMetrics{UploadedBytes: now, TotalBytes: total})
+	}, s.logger)
+	// Upload progress is live-only: it is cleared once the upload ends so
+	// terminal jobs never report bytes.
+	s.clearJobProgress(jobID)
+	if err != nil {
+		// Upload failed: remove the staged bundle (best-effort) so no local
+		// copy lingers, then fail the job with no backup record.
+		bg.Error("drive upload failed", "job", jobID, "repo", repo.FullName, "bundle", outcome.BundleName, "error", err)
+		_ = os.Remove(outcome.BundlePath)
+		s.finishProtectedJob(jobID, repo, "drive upload failed: "+err.Error())
+		return
+	}
+
+	// Upload succeeded: the temporary local bundle is no longer needed.
+	if err := os.Remove(outcome.BundlePath); err != nil {
+		bg.Warn("remove temporary bundle after upload", "job", jobID, "bundle", outcome.BundlePath, "error", err)
+	}
+
+	// The backup record exists only for completed Drive uploads: every visible
+	// backup is a real Drive copy.
+	setState(state.JobRecording)
 	record := state.BackupRecord{
 		ID:              uuid.NewString(),
 		ProtectedRepoID: repo.ID,
@@ -228,29 +256,10 @@ func (s *Server) runProtectedBackup(jobID string, repo state.ProtectedRepo) {
 		BundleName:      outcome.BundleName,
 		BundleSize:      outcome.SizeBytes,
 		BundleSHA256:    outcome.SHA256,
-		// The bundle is always written to local disk first. Drive upload, when
-		// enabled, runs afterwards and upgrades the status to "uploaded".
-		Status: state.BackupStatusBundled,
+		DriveFileID:     driveID,
+		Status:          state.BackupStatusUploaded,
 	}
 	s.stateStore.AddBackupRecord(record)
-
-	setState(state.JobRecording)
-
-	if driveEnabledFor(cfg.Cloud) {
-		setState(state.JobUploading)
-		driveID, err := s.driveUpload(ctx, outcome.BundlePath, cfg.Cloud, s.logger)
-		if err != nil {
-			// Preserve the local bundle and its record; only the job fails.
-			bg.Error("drive upload failed", "job", jobID, "repo", repo.FullName, "bundle", outcome.BundleName, "error", err)
-			s.finishProtectedJob(jobID, repo, "drive upload failed: "+err.Error())
-			return
-		}
-		record.DriveFileID = driveID
-		record.Status = state.BackupStatusUploaded
-		if err := s.stateStore.UpdateBackupRecord(record); err != nil {
-			bg.Warn("persist drive upload status", "job", jobID, "record", record.ID, "error", err)
-		}
-	}
 
 	j := getJob()
 	j.State = state.JobCompleted
@@ -261,7 +270,7 @@ func (s *Server) runProtectedBackup(jobID string, repo state.ProtectedRepo) {
 	if err := s.saveState(); err != nil {
 		bg.Warn("persist completed backup job", "job", jobID, "error", err)
 	}
-	bg.Info("protected backup completed", "job", jobID, "repo", repo.FullName, "bundle", outcome.BundleName, "driveFileID", record.DriveFileID)
+	bg.Info("protected backup completed", "job", jobID, "repo", repo.FullName, "bundle", outcome.BundleName, "driveFileID", driveID)
 }
 
 // finishProtectedJob marks a job failed with a sanitized message and persists it.
@@ -308,11 +317,134 @@ func (s *Server) handleBackupProtectedRepo(w http.ResponseWriter, r *http.Reques
 	case err == errJobInFlight:
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "A backup for this repository is already running."})
 		return
+	case err == errDriveNotConnected:
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "Google Drive is not connected. Connect your Google account before backing up.",
+		})
+		return
 	case err != nil:
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not start the backup"})
 		return
 	}
-	writeJSON(w, http.StatusAccepted, toJobView(job))
+	writeJSON(w, http.StatusAccepted, s.toJobView(job))
+}
+
+// handleBackupRepo triggers a backup for a single GitHub repository addressed by
+// its GitHub numeric id, without requiring the user to protect it first. It
+// resolves the repository against the live discovered set and materializes the
+// backup engine's internal per-repository record on demand, then delegates to
+// the existing backup machinery (startProtectedBackup) unchanged.
+func (s *Server) handleBackupRepo(w http.ResponseWriter, r *http.Request) {
+	if !s.cloudReady(w) {
+		return
+	}
+	sess := s.sessionFromRequest(r)
+	if sess == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
+		return
+	}
+	if !validateCSRF(sess, r.Header.Get("X-CSRF-Token")) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "CSRF validation failed."})
+		return
+	}
+
+	githubID, err := strconv.ParseInt(r.PathValue("githubId"), 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid repository id."})
+		return
+	}
+
+	repos, err := s.discoverRepositories(r)
+	if err != nil {
+		s.writeDiscoveryError(w, err)
+		return
+	}
+	var found *providers.Repository
+	for i := range repos {
+		if repos[i].ID == githubID {
+			found = &repos[i]
+			break
+		}
+	}
+	if found == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "repository not found on GitHub"})
+		return
+	}
+
+	internalRepo, err := s.findOrCreateInternalRepo(found.ID, found.FullName, found.DefaultBranch)
+	if err != nil {
+		s.logger.Warn("ensure internal repo record", "repo", found.FullName, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not start the backup"})
+		return
+	}
+
+	job, err := s.startProtectedBackup(internalRepo.ID)
+	switch {
+	case err == errJobInFlight:
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "A backup for this repository is already running."})
+		return
+	case err == errDriveNotConnected:
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "Google Drive is not connected. Connect your Google account before backing up.",
+		})
+		return
+	case err != nil:
+		s.logger.Warn("start backup", "repo", found.FullName, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not start the backup"})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, s.toJobView(job))
+}
+
+// handleBackupAll starts backups for the user's GitHub repositories directly.
+// Nothing has to be protected first: every repository is eligible, matching the
+// existing backup engine (each starts unless a backup is already running for
+// it). Drive connectivity is required, since the engine only writes to Drive;
+// in-flight repositories are skipped, not treated as errors.
+func (s *Server) handleBackupAll(w http.ResponseWriter, r *http.Request) {
+	if !s.cloudReady(w) {
+		return
+	}
+	sess := s.sessionFromRequest(r)
+	if sess == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
+		return
+	}
+	if !validateCSRF(sess, r.Header.Get("X-CSRF-Token")) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "CSRF validation failed."})
+		return
+	}
+	if !s.driveConnected() {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "Google Drive is not connected. Connect your Google account before backing up.",
+		})
+		return
+	}
+
+	repos, err := s.discoverRepositories(r)
+	if err != nil {
+		s.writeDiscoveryError(w, err)
+		return
+	}
+
+	var started []jobView
+	for _, repo := range repos {
+		internalRepo, err := s.findOrCreateInternalRepo(repo.ID, repo.FullName, repo.DefaultBranch)
+		if err != nil {
+			s.logger.Warn("ensure internal repo record (backup all)", "repo", repo.FullName, "error", err)
+			continue
+		}
+		job, err := s.startProtectedBackup(internalRepo.ID)
+		if err == errJobInFlight {
+			continue // already running; skip rather than fail the sweep
+		}
+		if err != nil {
+			s.logger.Warn("start backup (backup all)", "repo", repo.FullName, "error", err)
+			continue
+		}
+		started = append(started, s.toJobView(job))
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"jobs": started})
 }
 
 // handleProtectedBackupJob returns a single state-backed backup job by id.
@@ -327,7 +459,7 @@ func (s *Server) handleProtectedBackupJob(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "backup job not found"})
 		return
 	}
-	writeJSON(w, http.StatusOK, toJobView(job))
+	writeJSON(w, http.StatusOK, s.toJobView(job))
 }
 
 // handleProtectedBackupJobs lists the backup jobs for a protected repository.
@@ -348,7 +480,7 @@ func (s *Server) handleProtectedBackupJobs(w http.ResponseWriter, r *http.Reques
 			out = append(out, j)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobsView(out)})
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": s.jobsView(out)})
 }
 
 // handleProtectedBackupHistory lists the immutable backup records for a
@@ -368,6 +500,33 @@ func (s *Server) handleProtectedBackupHistory(w http.ResponseWriter, r *http.Req
 
 // --- response shaping ---
 
+// jobProgressMetrics is the live upload byte progress for a single backup job,
+// kept in memory only (never persisted) and merged into the job API view.
+type jobProgressMetrics struct {
+	UploadedBytes int64
+	TotalBytes    int64
+}
+
+func (s *Server) setJobProgress(id string, m jobProgressMetrics) {
+	s.jobProgressMu.Lock()
+	defer s.jobProgressMu.Unlock()
+	s.jobProgress[id] = m
+}
+
+// jobProgressFor returns the live upload progress for a job, if any.
+func (s *Server) jobProgressFor(id string) (jobProgressMetrics, bool) {
+	s.jobProgressMu.Lock()
+	defer s.jobProgressMu.Unlock()
+	m, ok := s.jobProgress[id]
+	return m, ok
+}
+
+func (s *Server) clearJobProgress(id string) {
+	s.jobProgressMu.Lock()
+	defer s.jobProgressMu.Unlock()
+	delete(s.jobProgress, id)
+}
+
 // jobView is the JSON shape of a backup job exposed to the UI.
 type jobView struct {
 	ID              string `json:"id"`
@@ -377,9 +536,14 @@ type jobView struct {
 	StartedAt       string `json:"startedAt"`
 	FinishedAt      string `json:"finishedAt,omitempty"`
 	Error           string `json:"error,omitempty"`
+	// UploadedBytes/TotalBytes/Progress are live-only upload progress (see
+	// jobProgressMetrics); they are omitted for non-running jobs.
+	UploadedBytes int64 `json:"uploadedBytes,omitempty"`
+	TotalBytes    int64 `json:"totalBytes,omitempty"`
+	Progress      int   `json:"progress,omitempty"`
 }
 
-func toJobView(j state.BackupJob) jobView {
+func (s *Server) toJobView(j state.BackupJob) jobView {
 	v := jobView{
 		ID:              j.ID,
 		ProtectedRepoID: j.ProtectedRepoID,
@@ -391,13 +555,27 @@ func toJobView(j state.BackupJob) jobView {
 	if !j.FinishedAt.IsZero() {
 		v.FinishedAt = j.FinishedAt.Format(time.RFC3339)
 	}
+	if m, ok := s.jobProgressFor(j.ID); ok {
+		v.UploadedBytes = m.UploadedBytes
+		v.TotalBytes = m.TotalBytes
+		if m.TotalBytes > 0 {
+			pct := m.UploadedBytes * 100 / m.TotalBytes
+			if pct < 0 {
+				pct = 0
+			}
+			if pct > 100 {
+				pct = 100
+			}
+			v.Progress = int(pct)
+		}
+	}
 	return v
 }
 
-func jobsView(in []state.BackupJob) []jobView {
+func (s *Server) jobsView(in []state.BackupJob) []jobView {
 	out := make([]jobView, 0, len(in))
 	for _, j := range in {
-		out = append(out, toJobView(j))
+		out = append(out, s.toJobView(j))
 	}
 	return out
 }

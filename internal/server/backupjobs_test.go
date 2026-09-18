@@ -3,12 +3,12 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/b-isry/gitsafe/internal/state"
-	"github.com/b-isry/gitsafe/internal/tokenstore"
 )
 
 // --- handler tests ---
@@ -72,11 +72,7 @@ func TestBackupProtectedRepoUnknown(t *testing.T) {
 func TestBackupProtectedRepoAccepted(t *testing.T) {
 	st := &fakeStateStore{}
 	seedProtectedRepo(st, "p1", "acme/alpha", "main")
-	tk := newFakeTokenStore()
-	tk.data[tokenstore.GitHubToken] = "tok"
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
-
-	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
+	s := envCloudServer(t, st, true)
 	s.bundleBackup = func(ctx context.Context, fullName, token, output string) (bundleOutcome, error) {
 		return bundleOutcome{BundlePath: "x.bundle", BundleName: "x.bundle", SizeBytes: 5, SHA256: "abc"}, nil
 	}
@@ -148,7 +144,7 @@ func TestProtectedBackupJobsList(t *testing.T) {
 func TestProtectedBackupHistory(t *testing.T) {
 	st := &fakeStateStore{}
 	seedProtectedRepo(st, "p1", "acme/alpha", "main")
-	st.records = []state.BackupRecord{{ID: "r1", ProtectedRepoID: "p1", FullName: "acme/alpha", BundleName: "a.bundle", BundleSize: 12, Status: "bundled"}}
+	st.records = []state.BackupRecord{{ID: "r1", ProtectedRepoID: "p1", FullName: "acme/alpha", BundleName: "a.bundle", BundleSize: 12, Status: "uploaded"}}
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
 	rec := request(t, s, http.MethodGet, "/api/protected-repositories/p1/backups", nil)
 	if rec.Code != http.StatusOK {
@@ -160,7 +156,7 @@ func TestProtectedBackupHistory(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body.Backups) != 1 || body.Backups[0].BundleName != "a.bundle" || body.Backups[0].Status != "bundled" {
+	if len(body.Backups) != 1 || body.Backups[0].BundleName != "a.bundle" || body.Backups[0].Status != "uploaded" {
 		t.Fatalf("backups = %+v", body.Backups)
 	}
 }
@@ -179,11 +175,8 @@ func TestRunProtectedBackupSuccess(t *testing.T) {
 	st := &fakeStateStore{}
 	repo := seedProtectedRepo(st, "p1", "acme/alpha", "main")
 	st.CreateBackupJob(state.BackupJob{ID: "j1", ProtectedRepoID: "p1", FullName: repo.FullName, State: state.JobEnqueued})
-	tk := newFakeTokenStore()
-	tk.data[tokenstore.GitHubToken] = "tok"
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
 
-	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
+	s := envCloudServer(t, st, true)
 	s.bundleBackup = func(ctx context.Context, fullName, token, output string) (bundleOutcome, error) {
 		if token != "tok" {
 			t.Fatalf("bundler token = %q", token)
@@ -192,6 +185,12 @@ func TestRunProtectedBackupSuccess(t *testing.T) {
 			t.Fatalf("bundler fullName = %q", fullName)
 		}
 		return bundleOutcome{BundlePath: "/out/acme_alpha.bundle", BundleName: "acme_alpha.bundle", SizeBytes: 99, SHA256: "deadbeef"}, nil
+	}
+	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
+		if folderID != "folder-1" || refreshToken != "drv-refresh" {
+			t.Fatalf("upload folderID/refreshToken = %q/%q", folderID, refreshToken)
+		}
+		return "drive-file-123", nil
 	}
 
 	s.runProtectedBackup("j1", repo)
@@ -213,8 +212,11 @@ func TestRunProtectedBackupSuccess(t *testing.T) {
 	if rec.BundleName != "acme_alpha.bundle" || rec.BundleSize != 99 || rec.BundleSHA256 != "deadbeef" {
 		t.Fatalf("record = %+v", rec)
 	}
-	if rec.Status != "bundled" || rec.DefaultBranch != "main" {
+	if rec.Status != state.BackupStatusUploaded || rec.DefaultBranch != "main" {
 		t.Fatalf("record status/branch = %q/%q", rec.Status, rec.DefaultBranch)
+	}
+	if rec.DriveFileID != "drive-file-123" {
+		t.Fatalf("record driveFileID = %q", rec.DriveFileID)
 	}
 }
 
@@ -222,11 +224,8 @@ func TestRunProtectedBackupBundlerFailure(t *testing.T) {
 	st := &fakeStateStore{}
 	repo := seedProtectedRepo(st, "p1", "acme/alpha", "main")
 	st.CreateBackupJob(state.BackupJob{ID: "j1", ProtectedRepoID: "p1", FullName: repo.FullName, State: state.JobEnqueued})
-	tk := newFakeTokenStore()
-	tk.data[tokenstore.GitHubToken] = "tok"
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
 
-	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
+	s := envCloudServer(t, st, true)
 	s.bundleBackup = func(ctx context.Context, fullName, token, output string) (bundleOutcome, error) {
 		return bundleOutcome{}, errBoom
 	}
@@ -267,3 +266,38 @@ var errBoom = &boomError{}
 type boomError struct{}
 
 func (e *boomError) Error() string { return "boom" }
+
+// TestJobViewIncludesUploadProgress verifies the live upload byte progress is
+// surfaced through the job view and cleared once the upload ends.
+func TestJobViewIncludesUploadProgress(t *testing.T) {
+	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
+	job := state.BackupJob{ID: "j1", State: state.JobUploading}
+
+	s.setJobProgress("j1", jobProgressMetrics{UploadedBytes: 25, TotalBytes: 100})
+	v := s.toJobView(job)
+	if v.UploadedBytes != 25 || v.TotalBytes != 100 || v.Progress != 25 {
+		t.Fatalf("view progress = %+v, want 25/100/25", v)
+	}
+
+	// A terminal job (progress cleared) must not report stale bytes.
+	s.clearJobProgress("j1")
+	if v := s.toJobView(job); v.UploadedBytes != 0 || v.TotalBytes != 0 || v.Progress != 0 {
+		t.Fatalf("view after clear = %+v, want no progress", v)
+	}
+}
+
+// TestJobViewProgressClampsPercent verifies the progress percentage is clamped
+// to the 0..100 range even if an uploader over-reports.
+func TestJobViewProgressClampsPercent(t *testing.T) {
+	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
+	job := state.BackupJob{ID: "j1", State: state.JobUploading}
+
+	s.setJobProgress("j1", jobProgressMetrics{UploadedBytes: 200, TotalBytes: 100})
+	if v := s.toJobView(job); v.Progress != 100 {
+		t.Fatalf("progress = %d, want clamped 100", v.Progress)
+	}
+	s.setJobProgress("j1", jobProgressMetrics{UploadedBytes: 0, TotalBytes: 100})
+	if v := s.toJobView(job); v.Progress != 0 {
+		t.Fatalf("progress = %d, want 0", v.Progress)
+	}
+}

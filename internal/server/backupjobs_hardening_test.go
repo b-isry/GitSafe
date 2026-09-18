@@ -3,13 +3,13 @@ package server
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/b-isry/gitsafe/internal/state"
-	"github.com/b-isry/gitsafe/internal/tokenstore"
 )
 
 // TestRunProtectedBackupSanitizesJobError verifies that a bundler failure whose
@@ -18,7 +18,10 @@ import (
 func TestRunProtectedBackupSanitizesJobError(t *testing.T) {
 	st := &fakeStateStore{}
 	repo := seedDriveJob(t, st)
-	s := envCloudServer(t, st, false) // Drive disabled: pure local path
+	s := envCloudServer(t, st, true) // Drive connected: backup flow reaches the bundler
+	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
+		return "drive-x", nil
+	}
 	s.bundleBackup = func(ctx context.Context, fullName, token, output string) (bundleOutcome, error) {
 		return bundleOutcome{}, fmt.Errorf("mirror clone \"https://x-access-token:SUPERSECRET@github.com/%s.git\": boom", fullName)
 	}
@@ -36,7 +39,7 @@ func TestRunProtectedBackupSanitizesJobError(t *testing.T) {
 		t.Fatalf("job.Error lost the useful message: %q", job.Error)
 	}
 	// The API view must also be clean.
-	v := toJobView(job)
+	v := s.toJobView(job)
 	if strings.Contains(v.Error, "SUPERSECRET") {
 		t.Fatalf("job view leaked the token: %q", v.Error)
 	}
@@ -48,10 +51,8 @@ func TestRunProtectedBackupSanitizesJobError(t *testing.T) {
 func TestStartProtectedBackupRemovesOrphanJobOnSaveFailure(t *testing.T) {
 	st := &fakeStateStore{}
 	seedProtectedRepo(st, "p1", "acme/alpha", "main")
+	s := envCloudServer(t, st, true)
 	st.errors = map[string]error{"save": errBoom}
-	tk := newFakeTokenStore()
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
-	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
 	s.bundleBackup = func(ctx context.Context, fullName, token, output string) (bundleOutcome, error) {
 		return bundleOutcome{}, nil
 	}
@@ -69,10 +70,10 @@ func TestStartProtectedBackupRemovesOrphanJobOnSaveFailure(t *testing.T) {
 func TestProtectedBackupConcurrentTriggers(t *testing.T) {
 	st := &fakeStateStore{}
 	seedProtectedRepo(st, "p1", "acme/alpha", "main")
-	tk := newFakeTokenStore()
-	tk.data[tokenstore.GitHubToken] = "tok"
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
-	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
+	s := envCloudServer(t, st, true)
+	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
+		return "drive-x", nil
+	}
 	// Block the spawned job goroutine in the "cloning" phase so the job stays
 	// non-terminal while all 16 triggers run, making the dedup assertions
 	// deterministic.
@@ -123,10 +124,10 @@ func TestProtectedBackupConcurrentTriggers(t *testing.T) {
 func TestProtectedBackupHistoryListWhileRunning(t *testing.T) {
 	st := &fakeStateStore{}
 	seedProtectedRepo(st, "p1", "acme/alpha", "main")
-	tk := newFakeTokenStore()
-	tk.data[tokenstore.GitHubToken] = "tok"
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
-	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
+	s := envCloudServer(t, st, true)
+	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
+		return "drive-x", nil
+	}
 	s.bundleBackup = func(ctx context.Context, fullName, token, output string) (bundleOutcome, error) {
 		return bundleOutcome{BundlePath: "/out/x.bundle", BundleName: "x.bundle", SizeBytes: 1, SHA256: "a"}, nil
 	}

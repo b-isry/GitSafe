@@ -7,12 +7,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
-	"github.com/b-isry/gitsafe/internal/config"
 	"github.com/b-isry/gitsafe/internal/state"
 	"github.com/b-isry/gitsafe/internal/tokenstore"
 )
 
+// envCloudServer builds a server with the Phase 1 cloud wiring attached. When
+// enabled, it also configures the Drive OAuth application and seeds a connected
+// Drive account (refresh token in the keychain, connection in state).
 func envCloudServer(t *testing.T, st *fakeStateStore, enabled bool) *Server {
 	t.Helper()
 	tk := newFakeTokenStore()
@@ -21,9 +24,18 @@ func envCloudServer(t *testing.T, st *fakeStateStore, enabled bool) *Server {
 
 	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
 	if enabled {
-		s.app.Config.Cloud = config.CloudConfig{Enabled: true, CredentialsFile: "/creds/keys.json"}
-	} else {
-		s.app.Config.Cloud = config.CloudConfig{Enabled: false, CredentialsFile: ""}
+		s.ConfigureDriveOAuth(&DriveOAuth{
+			ClientID:     "drive-id",
+			ClientSecret: "drive-secret",
+			RedirectURL:  "http://127.0.0.1:8080/api/auth/drive/callback",
+		})
+		tk.data[tokenstore.DriveToken] = "drv-refresh"
+		st.SetDriveConnection(state.DriveConnection{
+			AccountEmail:    "octo@example.com",
+			ConnectedAt:     time.Now(),
+			StorageFolderID: "folder-1",
+			TokenRef:        tokenstore.DriveToken,
+		})
 	}
 	return s
 }
@@ -41,20 +53,23 @@ func stubDriveBundler(s *Server) {
 	}
 }
 
-// TestRunProtectedBackupUploadSuccess verifies the happy path: Drive enabled, a
-// successful upload marks the job completed and upgrades the record to
-// "uploaded" with the Drive file ID persisted.
+// TestRunProtectedBackupUploadSuccess verifies the happy path: a connected Drive
+// account, a successful upload, the temporary local bundle removed, and exactly
+// one "uploaded" record carrying the Drive file ID.
 func TestRunProtectedBackupUploadSuccess(t *testing.T) {
 	st := &fakeStateStore{}
 	repo := seedDriveJob(t, st)
 	s := envCloudServer(t, st, true)
 	stubDriveBundler(s)
-	s.driveUpload = func(ctx context.Context, bundlePath string, cfg config.CloudConfig, logger *slog.Logger) (string, error) {
+	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
 		if bundlePath != "/out/acme_alpha.bundle" {
 			t.Fatalf("upload bundle = %q", bundlePath)
 		}
-		if !cfg.Enabled || cfg.CredentialsFile == "" {
-			t.Fatalf("upload cfg = %+v", cfg)
+		if folderID != "folder-1" {
+			t.Fatalf("upload folderID = %q, want folder-1", folderID)
+		}
+		if refreshToken != "drv-refresh" {
+			t.Fatalf("upload refreshToken = %q, want drv-refresh", refreshToken)
 		}
 		return "drive-file-123", nil
 	}
@@ -79,13 +94,14 @@ func TestRunProtectedBackupUploadSuccess(t *testing.T) {
 }
 
 // TestRunProtectedBackupUploadFailure verifies that a failed Drive upload fails
-// the job while preserving the local bundle record as local-only ("bundled").
+// the job with a clear message and creates NO backup record (a failed backup is
+// not an uploaded one).
 func TestRunProtectedBackupUploadFailure(t *testing.T) {
 	st := &fakeStateStore{}
 	repo := seedDriveJob(t, st)
 	s := envCloudServer(t, st, true)
 	stubDriveBundler(s)
-	s.driveUpload = func(ctx context.Context, bundlePath string, cfg config.CloudConfig, logger *slog.Logger) (string, error) {
+	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
 		return "", errBoom
 	}
 
@@ -99,42 +115,39 @@ func TestRunProtectedBackupUploadFailure(t *testing.T) {
 		t.Fatal("expected a drive upload failure message")
 	}
 	records := st.BackupRecordsForRepo("p1")
-	if len(records) != 1 {
-		t.Fatalf("expected the local record to be preserved, got %+v", records)
-	}
-	if records[0].Status != state.BackupStatusBundled {
-		t.Fatalf("record status = %q, want bundled (local preserved)", records[0].Status)
-	}
-	if records[0].DriveFileID != "" {
-		t.Fatalf("record driveFileID should be empty on failure, got %q", records[0].DriveFileID)
+	if len(records) != 0 {
+		t.Fatalf("expected no record after a failed upload, got %+v", records)
 	}
 }
 
-// TestRunProtectedBackupUploadSkipped verifies Drive disabled completes the job
-// locally without invoking the uploader.
-func TestRunProtectedBackupUploadSkipped(t *testing.T) {
+// TestRunProtectedBackupDriveNotConnected verifies that without a connected
+// Drive account the job fails fast with a clear message and neither the uploader
+// nor the bundler is invoked and no record is created.
+func TestRunProtectedBackupDriveNotConnected(t *testing.T) {
 	st := &fakeStateStore{}
 	repo := seedDriveJob(t, st)
 	s := envCloudServer(t, st, false)
+	uploaded := false
 	stubDriveBundler(s)
-	called := false
-	s.driveUpload = func(ctx context.Context, bundlePath string, cfg config.CloudConfig, logger *slog.Logger) (string, error) {
-		called = true
+	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
+		uploaded = true
 		return "never", nil
 	}
 
 	s.runProtectedBackup("j1", repo)
 
-	if called {
-		t.Fatal("driveUpload should not be called when Drive is disabled")
+	if uploaded {
+		t.Fatal("driveUpload should not be called when Drive is not connected")
 	}
 	job, ok := st.BackupJob("j1")
-	if !ok || job.State != state.JobCompleted {
+	if !ok || job.State != state.JobFailed {
 		t.Fatalf("job = %+v ok=%v", job, ok)
 	}
-	records := st.BackupRecordsForRepo("p1")
-	if len(records) != 1 || records[0].Status != state.BackupStatusBundled {
-		t.Fatalf("records = %+v", records)
+	if job.Error == "" {
+		t.Fatal("expected a Drive-not-connected failure message")
+	}
+	if records := st.BackupRecordsForRepo("p1"); len(records) != 0 {
+		t.Fatalf("expected no record when Drive is not connected, got %+v", records)
 	}
 }
 
@@ -145,7 +158,7 @@ func TestRunProtectedBackupReachesUploading(t *testing.T) {
 	repo := seedDriveJob(t, st)
 	s := envCloudServer(t, st, true)
 	stubDriveBundler(s)
-	s.driveUpload = func(ctx context.Context, bundlePath string, cfg config.CloudConfig, logger *slog.Logger) (string, error) {
+	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
 		job, ok := st.BackupJob("j1")
 		if !ok || job.State != state.JobUploading {
 			t.Fatalf("job during upload = %+v ok=%v", job, ok)
@@ -161,16 +174,18 @@ func TestRunProtectedBackupReachesUploading(t *testing.T) {
 	}
 }
 
-// TestRunProtectedBackupDriveUploadUpdatesPersistException verifies the server
-// tolerates a store unable to update the record (logs, still completes).
-func TestRunProtectedBackupDriveUploadUpdateRecordError(t *testing.T) {
+// TestRunProtectedBackupNoRecordBeforeUploadSuccess verifies the backup record
+// is only written after a successful Drive upload, never before.
+func TestRunProtectedBackupNoRecordBeforeUploadSuccess(t *testing.T) {
 	st := &fakeStateStore{}
-	st.errors = map[string]error{"updateRecord": errBoom}
 	repo := seedDriveJob(t, st)
 	s := envCloudServer(t, st, true)
 	stubDriveBundler(s)
-	s.driveUpload = func(ctx context.Context, bundlePath string, cfg config.CloudConfig, logger *slog.Logger) (string, error) {
-		return "drive-y", nil
+	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
+		if records := st.BackupRecordsForRepo("p1"); len(records) != 0 {
+			t.Fatalf("record created before upload success: %+v", records)
+		}
+		return "drive-z", nil
 	}
 
 	s.runProtectedBackup("j1", repo)
@@ -179,10 +194,13 @@ func TestRunProtectedBackupDriveUploadUpdateRecordError(t *testing.T) {
 	if !ok || job.State != state.JobCompleted {
 		t.Fatalf("job = %+v ok=%v", job, ok)
 	}
+	if records := st.BackupRecordsForRepo("p1"); len(records) != 1 {
+		t.Fatalf("records = %+v", records)
+	}
 }
 
-// TestAPIConnectionsDriveConfigured verifies the connections endpoint reports
-// the Drive configured/connected status.
+// TestAPIConnectionsDriveConfigured verifies the connections endpoint reports a
+// connected Drive account.
 func TestAPIConnectionsDriveConfigured(t *testing.T) {
 	s := envCloudServer(t, &fakeStateStore{}, true)
 	rec := request(t, s, http.MethodGet, "/api/connections", nil)
@@ -195,7 +213,7 @@ func TestAPIConnectionsDriveConfigured(t *testing.T) {
 }
 
 // TestAPIConnectionsDriveNotConfigured verifies Drive reports unconfigured when
-// cloud settings are off.
+// the deployment has no Drive OAuth application registered.
 func TestAPIConnectionsDriveNotConfigured(t *testing.T) {
 	s := envCloudServer(t, &fakeStateStore{}, false)
 	rec := request(t, s, http.MethodGet, "/api/connections", nil)

@@ -2,12 +2,12 @@ package server
 
 import (
 	"context"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/b-isry/gitsafe/internal/state"
-	"github.com/b-isry/gitsafe/internal/tokenstore"
 )
 
 // TestBackupConcurrencyCapped verifies that starting more protected backups than
@@ -19,10 +19,10 @@ func TestBackupConcurrencyCapped(t *testing.T) {
 	for i := 0; i < total; i++ {
 		seedProtectedRepo(st, string(rune('a'+i)), "acme/repo-"+string(rune('a'+i)), "main")
 	}
-	tk := newFakeTokenStore()
-	tk.data[tokenstore.GitHubToken] = "tok"
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
-	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
+	s := envCloudServer(t, st, true)
+	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
+		return "drive-x", nil
+	}
 
 	var inFlight atomic.Int32
 	var exceeded atomic.Bool
