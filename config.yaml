@@ -1,22 +1,13 @@
-rootPath: C:\Users\Bisrat\Desktop\Projects
-days: 60
 outputPath: C:\Users\Bisrat\Desktop\Projects\GitSafe\backups
-backupHistory: true
-retention:
-    keepLocal: 0
-    keepLocalDays: 0
-    keepJobs: 0
-    keepDriveDays: 0
-    driveRetentionEnabled: false
-    scheduledCleanupEnabled: false
-    scheduledCleanupIntervalDays: 0
-    cleanupHistoryLimit: 0
+days: 60
 cloud:
     enabled: false
     credentialsFile: credentials.json
-notifications:
-    enabled: false
-    type: webhook
-    notifyOnSuccess: false
-    notifyOnFailure: true
-repositoryRetentionOverrides: []
+driveOAuth:
+    # Console URL: Google Cloud > APIs & Services > Credentials > OAuth client
+    # ID (Web application). The client id is non-secret and can also be set via
+    # GITSAFE_DRIVE_CLIENT_ID (env takes precedence). The client secret is
+    # always supplied from the environment (GITSAFE_DRIVE_CLIENT_SECRET).
+    # redirectUrl MUST exactly match the Authorized redirect URI registered in
+    # Google Cloud for this OAuth client.
+    redirectUrl: http://127.0.0.1:8080/api/auth/drive/callback

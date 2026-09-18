@@ -2,3 +2,4 @@ credentials.json
 backups/
 /bin/
 DESIGN.md
+.env
