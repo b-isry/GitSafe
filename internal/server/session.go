@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// sessionCookieName is the opaque, httpOnly, SameSite=Strict session cookie.
+// sessionCookieName is the opaque, httpOnly, SameSite=Lax session cookie.
 // It holds only the session ID; no token, OAuth state, or other secret is ever
 // placed in a cookie.
 const sessionCookieName = "gitsafe_session"
@@ -21,11 +21,13 @@ const sessionTTL = 2 * time.Hour
 // session is the server-side state bound to an opaque cookie. It is held only
 // in memory — never serialized to state.json or anywhere else.
 type session struct {
-	id        string
-	csrf      string
-	ghState   string // OAuth state bound to this session (single-use)
-	ghStateUs bool   // whether the OAuth state has already been consumed
-	expiresAt time.Time
+	id         string
+	csrf       string
+	ghState    string // GitHub OAuth state bound to this session (single-use)
+	ghStateUs  bool   // whether the GitHub OAuth state has already been consumed
+	drvState   string // Drive OAuth state bound to this session (single-use)
+	drvStateUs bool   // whether the Drive OAuth state has already been consumed
+	expiresAt  time.Time
 }
 
 // sessionManager tracks in-memory sessions. It is concurrency-safe and prunes
@@ -87,6 +89,19 @@ func (m *sessionManager) consumeGitHubState(id, state string) bool {
 	return subtle.ConstantTimeCompare([]byte(s.ghState), []byte(state)) == 1
 }
 
+// consumeDriveState is the Drive-analogue of consumeGitHubState: matching,
+// unused, single-use state values validate exactly once.
+func (m *sessionManager) consumeDriveState(id, state string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok || s.drvStateUs || s.drvState == "" {
+		return false
+	}
+	s.drvStateUs = true
+	return subtle.ConstantTimeCompare([]byte(s.drvState), []byte(state)) == 1
+}
+
 // randToken returns a cryptographically random hex string.
 func randToken(n int) string {
 	b := make([]byte, n)
@@ -115,7 +130,10 @@ func (s *Server) ensureSession(w http.ResponseWriter, r *http.Request) *session 
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   false, // local-only 127.0.0.1 server
-		SameSite: http.SameSiteStrictMode,
+		// Lax keeps the cookie off cross-site subresource/POST requests (CSRF)
+		// while still attaching it to the top-level GET navigation that the
+		// OAuth callback uses when returning from the provider to 127.0.0.1.
+		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
 	return sess

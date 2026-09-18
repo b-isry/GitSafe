@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -29,6 +30,9 @@ type StateStore interface {
 	GitHubConnection() (state.GitHubConnection, bool)
 	SetGitHubConnection(state.GitHubConnection)
 	ClearGitHubConnection()
+	DriveConnection() (state.DriveConnection, bool)
+	SetDriveConnection(state.DriveConnection)
+	ClearDriveConnection()
 	ProtectedRepos() []state.ProtectedRepo
 	ProtectedRepo(id string) (state.ProtectedRepo, bool)
 	AddProtectedRepo(r state.ProtectedRepo) error
@@ -41,8 +45,6 @@ type StateStore interface {
 	BackupJob(id string) (state.BackupJob, bool)
 	UnfinishedJobs() []state.BackupJob
 	AddBackupRecord(rec state.BackupRecord)
-	UpdateBackupRecord(rec state.BackupRecord) error
-	RemoveBackupRecord(id string) error
 	BackupRecords() []state.BackupRecord
 	BackupRecordsForRepo(protectedRepoID string) []state.BackupRecord
 	Save() error
@@ -55,12 +57,28 @@ type TokenStore interface {
 	Delete(ref string) error
 }
 
-const githubClientSecretEnv = "GITSAFE_GITHUB_CLIENT_SECRET"
+const (
+	// githubClientSecretEnv is the deployment-level GitHub OAuth client secret.
+	// It is deliberately NOT part of user configuration: GitSafe operators own
+	// it, the end user never sees it, and it is never written to config files,
+	// logs, cookies, or API responses.
+	githubClientSecretEnv = "GITSAFE_GITHUB_CLIENT_SECRET"
+	// githubClientIDEnv is the deployment-level GitHub OAuth client id. It is
+	// non-secret (it appears in the authorization URL by design) but still
+	// deployment-owned: the UI never surfaces it.
+	githubClientIDEnv = "GITSAFE_GITHUB_CLIENT_ID"
+)
 
 // GitHubOAuthFromEnv returns the OAuth configuration from non-secret settings
 // and the client secret read from the environment. Returns (nil, false) when
-// the server should run without GitHub (simply appearing disconnected).
+// the server should run without GitHub (simply appearing disconnected to the
+// user). The client id may come from the environment variable first, falling
+// back to the configured value (config file), so operators can supply both
+// credentials purely through the environment.
 func GitHubOAuthFromEnv(clientID, redirectURL string) (*GitHubOAuth, bool) {
+	if id := os.Getenv(githubClientIDEnv); id != "" {
+		clientID = id
+	}
 	secret := os.Getenv(githubClientSecretEnv)
 	if clientID == "" || secret == "" {
 		return nil, false
@@ -109,16 +127,26 @@ func (s *Server) ConfigureCloud(stateStore StateStore, tokenStore TokenStore, oa
 			}
 			return token, identity.Scopes, identity, nil
 		}
+		// Server-side token revocation needs the client secret; without one it
+		// is skipped (it is best-effort anyway — local removal is the boundary).
+		if oauth.ClientSecret != "" {
+			s.revokeToken = func(ctx context.Context, token string) error {
+				return githuboauth.New(githuboauth.Config{
+					ClientID:     oauth.ClientID,
+					ClientSecret: oauth.ClientSecret,
+				}).Revoke(ctx, token)
+			}
+		}
 	}
 }
 
 // handleGitHubLogin begins the OAuth flow: mint a session, bind a single-use
-// OAuth state to it, and redirect to GitHub.
+// OAuth state to it, and redirect to GitHub. When the deployment has not
+// configured a GitHub application, the user gets a graceful page — never
+// developer-setup instructions or raw errors.
 func (s *Server) handleGitHubLogin(w http.ResponseWriter, r *http.Request) {
 	if s.github == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-			"error": "GitHub integration is not configured.",
-		})
+		s.writeGitHubUnavailable(w, "GitHub sign-in is not available right now.", "This can be enabled by your GitSafe administrator. Please try again later.")
 		return
 	}
 	sess := s.ensureSession(w, r)
@@ -137,12 +165,12 @@ func (s *Server) handleGitHubLogin(w http.ResponseWriter, r *http.Request) {
 
 // handleGitHubCallback completes the OAuth flow: validate the single-use state,
 // exchange the code for a token, resolve the account identity, and persist the
-// connection (token in the keychain, reference in state).
+// connection (token in the keychain, reference in state). Users see friendly,
+// specific messages (e.g. "authorization was cancelled") and never raw OAuth
+// errors, environment variables, or secrets.
 func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 	if s.github == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-			"error": "GitHub integration is not configured.",
-		})
+		s.writeGitHubUnavailable(w, "GitHub sign-in is not available right now.", "This can be enabled by your GitSafe administrator. Please try again later.")
 		return
 	}
 	sess := s.sessionFromRequest(r)
@@ -159,8 +187,13 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		// A missing code with error_* params means the user declined.
-		s.oauthError(w, "authorization was declined or failed")
+		// A declined authorization comes back without a code, with an error
+		// query parameter. Anything else missing a code is treated generically.
+		if r.URL.Query().Get("error") == "access_denied" {
+			s.oauthError(w, "GitHub authorization was cancelled.")
+			return
+		}
+		s.oauthError(w, "GitHub did not return an authorization code. Please try again.")
 		return
 	}
 
@@ -169,7 +202,12 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 
 	token, _, identity, err := s.connectGitHub(ctx, code)
 	if err != nil {
-		s.oauthError(w, "GitHub connection failed: "+err.Error())
+		if errors.Is(err, githuboauth.ErrDenied) {
+			s.oauthError(w, "GitHub authorization was cancelled.")
+			return
+		}
+		s.logger.Warn("github oauth callback failed", "error", err)
+		s.oauthError(w, "Could not finish connecting to GitHub. Please try again.")
 		return
 	}
 
@@ -215,14 +253,12 @@ func (s *Server) handleAPIConnections(w http.ResponseWriter, r *http.Request) {
 			github["scopes"] = conn.Scopes
 		}
 	}
-	cfg := s.app.Config.Cloud
-	driveConfigured := cfg.Enabled && cfg.CredentialsFile != ""
 	drive := map[string]any{
-		"connected":  driveConfigured,
-		"configured": driveConfigured,
+		"connected":  s.driveConnected(),
+		"configured": s.driveConfigured(),
 	}
-	if driveConfigured {
-		drive["credentialsFile"] = cfg.CredentialsFile
+	if dc, ok := s.driveConnection(); ok {
+		drive["accountEmail"] = dc.AccountEmail
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"github": github,
@@ -230,7 +266,11 @@ func (s *Server) handleAPIConnections(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleDisconnectGitHub removes the GitHub token and connection.
+// handleDisconnectGitHub removes the GitHub token and connection. Local
+// credential removal is the security boundary and always runs; server-side
+// token revocation via GitHub's API is a best-effort cleanup using the
+// deployment's client credentials, and a revocation failure never blocks the
+// disconnect.
 func (s *Server) handleDisconnectGitHub(w http.ResponseWriter, r *http.Request) {
 	sess := s.sessionFromRequest(r)
 	if sess == nil {
@@ -246,7 +286,11 @@ func (s *Server) handleDisconnectGitHub(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	var token string
 	if conn, ok := s.stateStore.GitHubConnection(); ok {
+		if t, err := s.tokenStore.Get(conn.TokenRef); err == nil {
+			token = t
+		}
 		if err := s.tokenStore.Delete(conn.TokenRef); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{
 				"error": "could not remove the access token",
@@ -261,8 +305,58 @@ func (s *Server) handleDisconnectGitHub(w http.ResponseWriter, r *http.Request) 
 		})
 		return
 	}
+
+	// Best-effort server-side revocation. The local credential is already gone;
+	// GitHub's endpoint authenticates with the app's own client credentials
+	// (never the user's token as bearer auth), so a failure only loses cleanup.
+	if token != "" && s.revokeToken != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		if err := s.revokeToken(ctx, token); err != nil {
+			s.logger.Warn("github oauth: token revocation failed (local credential already removed)", "error", err)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "disconnected"})
 }
+
+// writeGitHubUnavailable renders a self-contained, user-facing page explaining
+// that GitHub sign-in cannot be started right now. It must never mention
+// environment variables, client ids/secrets, or developer setup steps.
+func (s *Server) writeGitHubUnavailable(w http.ResponseWriter, title, body string) {
+	s.logger.Info("github oauth unconfigured")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	fmt.Fprintf(w, githubUnavailableHTML, title, body)
+}
+
+const githubUnavailableHTML = `<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GitSafe</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar-nav">
+      <span class="topbar-nav__brand">
+        <span class="brand__mark" aria-hidden="true"></span>
+        <span class="brand__name">GitSafe</span>
+      </span>
+    </header>
+    <main class="content">
+      <div class="onboarding">
+        <div class="hero-card">
+          <h1 class="hero-card__title">%s</h1>
+          <p class="hero-card__subtitle">%s</p>
+          <a class="btn btn--primary" href="/" style="margin-top:1.5rem">Back to GitSafe</a>
+        </div>
+      </div>
+    </main>
+  </div>
+</body>
+</html>`
 
 // handleCSRF issues the session's CSRF token. It must be fetched (establishing a
 // session) before mutating endpoints that require X-CSRF-Token.

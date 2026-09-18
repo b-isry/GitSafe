@@ -2,13 +2,16 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/b-isry/gitsafe/internal/providers"
 	"github.com/b-isry/gitsafe/internal/state"
+	"github.com/b-isry/gitsafe/internal/tokenstore"
 )
 
 // --- pure validation helper ---
@@ -161,6 +164,84 @@ func TestListProtectedRepositories(t *testing.T) {
 	if len(body.Repositories) != 1 || body.Repositories[0].GitHubID != 1 || body.Repositories[0].FullName != "a/b" {
 		t.Fatalf("repositories = %+v", body.Repositories)
 	}
+	if body.Repositories[0].LatestBackup != nil {
+		t.Fatalf("expected no latest backup, got %+v", body.Repositories[0].LatestBackup)
+	}
+}
+
+func TestLatestBackupForNone(t *testing.T) {
+	if got := latestBackupFor(nil); got != nil {
+		t.Fatalf("expected nil for no records, got %+v", got)
+	}
+}
+
+func TestLatestBackupForPicksNewest(t *testing.T) {
+	base := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	records := []state.BackupRecord{
+		{ID: "old", ProtectedRepoID: "p1", FullName: "a/b", CreatedAt: base, BundleSize: 100, Status: "failed"},
+		{ID: "new", ProtectedRepoID: "p1", FullName: "a/b", CreatedAt: base.Add(2 * time.Hour), BundleSize: 5000, Status: "uploaded", DriveFileID: "FILE123"},
+		{ID: "mid", ProtectedRepoID: "p1", FullName: "a/b", CreatedAt: base.Add(1 * time.Hour), BundleSize: 200, Status: "uploaded"},
+	}
+	got := latestBackupFor(records)
+	if got == nil {
+		t.Fatal("expected a view, got nil")
+	}
+	if got.Status != "uploaded" || got.BundleSizeBytes != 5000 {
+		t.Fatalf("unexpected view: %+v", got)
+	}
+	if got.DriveViewLink != "https://drive.google.com/file/d/FILE123/view" {
+		t.Fatalf("driveViewLink = %q", got.DriveViewLink)
+	}
+	if want := base.Add(2 * time.Hour).Format(time.RFC3339); got.CreatedAt != want {
+		t.Fatalf("createdAt = %q, want %q", got.CreatedAt, want)
+	}
+}
+
+func TestLatestBackupForNoDriveRecord(t *testing.T) {
+	base := time.Now()
+	got := latestBackupFor([]state.BackupRecord{
+		{ID: "r", ProtectedRepoID: "p1", CreatedAt: base, BundleSize: 512, Status: "uploaded"},
+	})
+	if got == nil {
+		t.Fatal("expected a view, got nil")
+	}
+	if got.DriveViewLink != "" {
+		t.Fatalf("expected no drive link for a record without a drive file id, got %q", got.DriveViewLink)
+	}
+}
+
+func TestListProtectedRepositoriesIncludesLatestBackup(t *testing.T) {
+	st := &fakeStateStore{}
+	st.protected = []state.ProtectedRepo{
+		{ID: "p1", GitHubID: 1, FullName: "a/b", DefaultBranch: "main"},
+	}
+	st.records = []state.BackupRecord{
+		{ID: "r1", ProtectedRepoID: "p1", FullName: "a/b", CreatedAt: time.Now(), BundleSize: 2048, Status: "uploaded", DriveFileID: "DRIVE-1"},
+	}
+	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
+	rec := request(t, s, http.MethodGet, "/api/protected-repositories", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var body struct {
+		Repositories []protectedRepoView `json:"repositories"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Repositories) != 1 {
+		t.Fatalf("repositories = %+v", body.Repositories)
+	}
+	lb := body.Repositories[0].LatestBackup
+	if lb == nil {
+		t.Fatal("expected a latest backup on the protected-repo view")
+	}
+	if lb.Status != "uploaded" || lb.BundleSizeBytes != 2048 {
+		t.Fatalf("latestBackup = %+v", lb)
+	}
+	if lb.DriveViewLink != "https://drive.google.com/file/d/DRIVE-1/view" {
+		t.Fatalf("driveViewLink = %q", lb.DriveViewLink)
+	}
 }
 
 func TestListProtectedRepositoriesNotConfigured(t *testing.T) {
@@ -234,5 +315,90 @@ func TestRemoveProtectedRepositoryNotConfigured(t *testing.T) {
 	rec := deleteProtected(t, s, cookie, csrf, "p1")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+}
+
+func TestPushStaleness(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	threshold := 30
+
+	// A recently-pushed repository is not stale and reports its day count.
+	recent := now.Add(-3 * 24 * time.Hour)
+	days, stale := pushStaleness(recent, now, threshold)
+	if stale || days == nil || *days != 3 {
+		t.Fatalf("recent push: stale=%v days=%v (want stale=false days=3)", stale, days)
+	}
+
+	// A push older than the threshold is stale.
+	old := now.Add(-74 * 24 * time.Hour)
+	days, stale = pushStaleness(old, now, threshold)
+	if !stale || days == nil || *days != 74 {
+		t.Fatalf("old push: stale=%v days=%v (want stale=true days=74)", stale, days)
+	}
+
+	// A zero PushedAt means never pushed: stale with a nil (null) day count.
+	days, stale = pushStaleness(time.Time{}, now, threshold)
+	if !stale || days != nil {
+		t.Fatalf("zero PushedAt: stale=%v days=%v (want stale=true days=nil)", stale, days)
+	}
+}
+
+func TestAPIRepositoriesIncludesStaleness(t *testing.T) {
+	st := &fakeStateStore{}
+	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
+	tk := newFakeTokenStore()
+	tk.data[tokenstore.GitHubToken] = "tok"
+	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
+	s.app.Config.Days = 30
+
+	now := time.Now()
+	s.githubLister = func(ctx context.Context, token string) ([]providers.Repository, error) {
+		if token != "tok" {
+			t.Fatalf("githubLister token = %q, want the stored token", token)
+		}
+		return []providers.Repository{
+			{ID: 1, FullName: "a/recent", PushedAt: now.Add(-3 * 24 * time.Hour)},
+			{ID: 2, FullName: "b/old", PushedAt: now.Add(-74 * 24 * time.Hour)},
+			{ID: 3, FullName: "c/never"},
+		}, nil
+	}
+
+	rec := request(t, s, http.MethodGet, "/api/repositories", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Repositories []map[string]any `json:"repositories"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]map[string]any{}
+	for _, r := range body.Repositories {
+		byName[r["fullName"].(string)] = r
+	}
+
+	recent := byName["a/recent"]
+	if recent["stale"] != false {
+		t.Fatalf("recent stale = %v, want false", recent["stale"])
+	}
+	if d, ok := recent["daysSinceLastPush"].(float64); !ok || d != 3 {
+		t.Fatalf("recent daysSinceLastPush = %v, want 3", recent["daysSinceLastPush"])
+	}
+
+	old := byName["b/old"]
+	if old["stale"] != true {
+		t.Fatalf("old stale = %v, want true", old["stale"])
+	}
+	if d, ok := old["daysSinceLastPush"].(float64); !ok || d != 74 {
+		t.Fatalf("old daysSinceLastPush = %v, want 74", old["daysSinceLastPush"])
+	}
+
+	never := byName["c/never"]
+	if never["stale"] != true {
+		t.Fatalf("never stale = %v, want true", never["stale"])
+	}
+	if v, present := never["daysSinceLastPush"]; !present || v != nil {
+		t.Fatalf("never daysSinceLastPush = %v, want null", never["daysSinceLastPush"])
 	}
 }

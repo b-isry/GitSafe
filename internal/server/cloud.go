@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -15,43 +16,62 @@ import (
 const cloudRepositoriesPage = "cloud-repositories"
 
 // handleCloudRepositories renders the page that lets the user discover GitHub
-// repositories and explicitly protect the ones GitSafe should back up.
+// repositories and explicitly protect the ones GitSafe should back up. The
+// page always presents an end-user "Connect GitHub" flow when disconnected,
+// regardless of whether the deployment has configured a GitHub application.
 func (s *Server) handleCloudRepositories(w http.ResponseWriter, r *http.Request) {
-	connected, configured := false, s.github != nil
+	view := CloudView{Configured: s.github != nil}
 	if s.stateStore != nil {
-		if _, ok := s.stateStore.GitHubConnection(); ok {
-			connected = true
+		if conn, ok := s.stateStore.GitHubConnection(); ok {
+			view.Connected = true
+			view.Login = conn.Login
+			view.Name = conn.Name
+			view.AvatarURL = conn.AvatarURL
 		}
 	}
 	s.render(w, cloudRepositoriesPage, renderData{
 		pageData: pageData{Active: "cloud-repositories", PageTitle: "Cloud Repositories"},
-		Cloud: CloudView{
-			Configured: configured,
-			Connected:  connected,
-		},
+		Cloud:    view,
 	})
 }
 
-// CloudView carries the cloud page's initial connection state so the UI can
-// decide whether to offer the discovery flow or a "connect GitHub" prompt.
+// CloudView carries the cloud page's initial connection state and account
+// details so the UI can show either the "connect GitHub" prompt or the
+// connected account header. It never carries credentials, tokens, or client
+// configuration.
 type CloudView struct {
 	Configured bool
 	Connected  bool
+	Login      string
+	Name       string
+	AvatarURL  string
 }
 
 // protectedRepoView is the JSON shape of a ProtectedRepo exposed to the UI.
 type protectedRepoView struct {
-	ID            string `json:"id"`
-	GitHubID      int64  `json:"githubId"`
-	FullName      string `json:"fullName"`
-	DefaultBranch string `json:"defaultBranch"`
-	AddedAt       string `json:"addedAt"`
+	ID            string            `json:"id"`
+	GitHubID      int64             `json:"githubId"`
+	FullName      string            `json:"fullName"`
+	DefaultBranch string            `json:"defaultBranch"`
+	AddedAt       string            `json:"addedAt"`
+	LatestBackup  *latestBackupView `json:"latestBackup,omitempty"`
+}
+
+// latestBackupView is the most recent backup record for a protected repo, used
+// so the UI can show a status dot, timestamp, size, and a Drive link without an
+// extra round trip per repository.
+type latestBackupView struct {
+	Status          string `json:"status"`
+	CreatedAt       string `json:"createdAt"`
+	BundleSizeBytes int64  `json:"bundleSizeBytes"`
+	DriveViewLink   string `json:"driveViewLink,omitempty"`
 }
 
 // handleAPIRepositories lists discovered repositories for the connected account
-// and annotates which of them are already protected. Returns a 503 when GitHub
-// is not configured, a 409 when not connected, and provider-specific errors for
-// upstream failures.
+// and annotates each with its actual backup state: whether the repository has a
+// successful backup on record and what the latest successful backup was. Returns
+// a 503 when GitHub is not configured, a 409 when not connected, and
+// provider-specific errors for upstream failures.
 func (s *Server) handleAPIRepositories(w http.ResponseWriter, r *http.Request) {
 	if !s.cloudReady(w) {
 		return
@@ -62,37 +82,92 @@ func (s *Server) handleAPIRepositories(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	protected := map[int64]bool{}
+	// Backup status is derived from actual successful backup records, never from
+	// configuration. The internal per-repository record (which the backup engine
+	// requires to correlate jobs and history) is used only to look up those
+	// records; the user never sees or creates it directly.
+	internal := map[int64]state.ProtectedRepo{}
 	for _, p := range s.stateStore.ProtectedRepos() {
-		protected[p.GitHubID] = true
-	}
-	protectedList := make([]int64, 0, len(protected))
-	for _, rp := range repos {
-		if protected[rp.ID] {
-			protectedList = append(protectedList, rp.ID)
-		}
+		internal[p.GitHubID] = p
 	}
 
+	threshold := s.app.ConfigSnapshot().Days
+	now := time.Now()
 	out := make([]map[string]any, 0, len(repos))
 	for _, rp := range repos {
+		daysSinceLastPush, stale := pushStaleness(rp.PushedAt, now, threshold)
+		var lb *latestBackupView
+		if rec, ok := internal[rp.ID]; ok {
+			lb = latestBackupFor(s.stateStore.BackupRecordsForRepo(rec.ID))
+		}
 		out = append(out, map[string]any{
-			"githubId":      rp.ID,
-			"fullName":      rp.FullName,
-			"private":       rp.Private,
-			"fork":          rp.Fork,
-			"archived":      rp.Archived,
-			"defaultBranch": rp.DefaultBranch,
-			"updatedAt":     rp.UpdatedAt,
-			"pushedAt":      rp.PushedAt,
-			"sizeKB":        rp.SizeKB,
-			"cloneUrl":      rp.CloneURL,
-			"protected":     protected[rp.ID],
+			"githubId":          rp.ID,
+			"fullName":          rp.FullName,
+			"private":           rp.Private,
+			"fork":              rp.Fork,
+			"archived":          rp.Archived,
+			"defaultBranch":     rp.DefaultBranch,
+			"updatedAt":         rp.UpdatedAt,
+			"pushedAt":          rp.PushedAt,
+			"sizeKB":            rp.SizeKB,
+			"cloneUrl":          rp.CloneURL,
+			"backedUp":          lb != nil,
+			"latestBackup":      lb,
+			"daysSinceLastPush": daysSinceLastPush,
+			"stale":             stale,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"repositories": out,
-		"protected":    protectedList,
 	})
+}
+
+// findOrCreateInternalRepo returns the internal per-repository record the backup
+// engine uses to track jobs and history for a GitHub repository, creating it on
+// demand. This is what lets the dashboard back up any repository directly: the
+// engine's record is materialized lazily at backup time instead of requiring a
+// user-facing "protect" step first.
+func (s *Server) findOrCreateInternalRepo(githubID int64, fullName, defaultBranch string) (state.ProtectedRepo, error) {
+	for _, r := range s.stateStore.ProtectedRepos() {
+		if r.GitHubID == githubID {
+			return r, nil
+		}
+	}
+	rec := state.ProtectedRepo{
+		ID:            uuid.NewString(),
+		GitHubID:      githubID,
+		FullName:      fullName,
+		DefaultBranch: defaultBranch,
+		AddedAt:       time.Now(),
+	}
+	if err := s.stateStore.AddProtectedRepo(rec); err != nil {
+		// A concurrent request already created the record; reuse it so this
+		// repository is never duplicated internally.
+		if errors.Is(err, state.ErrDuplicate) {
+			for _, r := range s.stateStore.ProtectedRepos() {
+				if r.GitHubID == githubID {
+					return r, nil
+				}
+			}
+		}
+		return state.ProtectedRepo{}, err
+	}
+	if err := s.saveState(); err != nil {
+		return state.ProtectedRepo{}, err
+	}
+	return rec, nil
+}
+
+// pushStaleness derives the staleness view for a discovered repository. A zero
+// PushedAt means "never pushed" and reports a nil day count (serialized as JSON
+// null) with stale true. Otherwise the elapsed days since the last push are
+// compared against the configured threshold.
+func pushStaleness(pushedAt, now time.Time, threshold int) (daysSinceLastPush *int, stale bool) {
+	if pushedAt.IsZero() {
+		return nil, true
+	}
+	days := int(now.Sub(pushedAt).Hours() / 24)
+	return &days, days >= threshold
 }
 
 // discoverRepositories resolves the connection token and returns the live
@@ -106,7 +181,7 @@ func (s *Server) discoverRepositories(r *http.Request) ([]providers.Repository, 
 	if err != nil {
 		return nil, errTokenMissing
 	}
-	return s.githubClientFor(token).ListRepositories(r.Context())
+	return s.githubLister(r.Context(), token)
 }
 
 // s (small) sentinel errors keep discovery failures distinguishable in handlers.
@@ -127,7 +202,10 @@ func (s *Server) writeDiscoveryError(w http.ResponseWriter, err error) {
 	case errors.Is(err, providers.ErrRateLimited):
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "GitHub rate limit reached. Try again later."})
 	default:
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Could not reach GitHub: " + err.Error()})
+		// Surface a generic, human-readable message rather than raw upstream
+		// error text, which could embed URLs, tokens, or implementation detail.
+		s.logger.Warn("github discovery failed", "error", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Could not reach GitHub. Please try again later."})
 	}
 }
 
@@ -266,9 +344,39 @@ func (s *Server) handleListProtectedRepositories(w http.ResponseWriter, _ *http.
 	repos := s.stateStore.ProtectedRepos()
 	out := make([]protectedRepoView, 0, len(repos))
 	for _, rp := range repos {
-		out = append(out, toProtectedView(rp))
+		view := toProtectedView(rp)
+		view.LatestBackup = latestBackupFor(s.stateStore.BackupRecordsForRepo(rp.ID))
+		out = append(out, view)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"repositories": out})
+}
+
+// latestBackupFor picks the newest successful backup record and shapes it for
+// the UI. It returns nil when the repository has no successful backup yet. Only
+// records with Status == BackupStatusUploaded count: a failed attempt, or
+// merely having been configured/protected, never establishes a backup.
+func latestBackupFor(records []state.BackupRecord) *latestBackupView {
+	var latest *state.BackupRecord
+	for i := range records {
+		if records[i].Status != state.BackupStatusUploaded {
+			continue
+		}
+		if latest == nil || records[i].CreatedAt.After(latest.CreatedAt) {
+			latest = &records[i]
+		}
+	}
+	if latest == nil {
+		return nil
+	}
+	view := &latestBackupView{
+		Status:          latest.Status,
+		CreatedAt:       latest.CreatedAt.Format(time.RFC3339),
+		BundleSizeBytes: latest.BundleSize,
+	}
+	if latest.DriveFileID != "" {
+		view.DriveViewLink = fmt.Sprintf("https://drive.google.com/file/d/%s/view", latest.DriveFileID)
+	}
+	return view
 }
 
 // handleRemoveProtectedRepository removes protection for a single repository by

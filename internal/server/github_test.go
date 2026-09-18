@@ -19,6 +19,8 @@ type fakeStateStore struct {
 	mu     sync.Mutex
 	gh     state.GitHubConnection
 	hasGh  bool
+	drv    state.DriveConnection
+	hasDrv bool
 	saved  bool
 	errors map[string]error
 
@@ -42,6 +44,23 @@ func (f *fakeStateStore) ClearGitHubConnection() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.hasGh = false
+}
+
+func (f *fakeStateStore) DriveConnection() (state.DriveConnection, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.drv, f.hasDrv
+}
+func (f *fakeStateStore) SetDriveConnection(c state.DriveConnection) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.drv = c
+	f.hasDrv = true
+}
+func (f *fakeStateStore) ClearDriveConnection() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hasDrv = false
 }
 
 func (f *fakeStateStore) BackupJobs() []state.BackupJob {
@@ -109,33 +128,6 @@ func (f *fakeStateStore) AddBackupRecord(rec state.BackupRecord) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.records = append(f.records, rec)
-}
-
-func (f *fakeStateStore) UpdateBackupRecord(rec state.BackupRecord) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if e := f.errors["updateRecord"]; e != nil {
-		return e
-	}
-	for i := range f.records {
-		if f.records[i].ID == rec.ID {
-			f.records[i] = rec
-			return nil
-		}
-	}
-	return state.ErrNotFound
-}
-
-func (f *fakeStateStore) RemoveBackupRecord(id string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for i := range f.records {
-		if f.records[i].ID == id {
-			f.records = append(f.records[:i], f.records[i+1:]...)
-			return nil
-		}
-	}
-	return state.ErrNotFound
 }
 
 func (f *fakeStateStore) BackupRecords() []state.BackupRecord {
@@ -294,6 +286,69 @@ func mustParse(t *testing.T, raw string) *url.URL {
 		t.Fatalf("parse %q: %v", raw, err)
 	}
 	return u
+}
+
+func TestGitHubOAuthFromEnvSourcesClientID(t *testing.T) {
+	// Start clean so ambient CI env vars cannot influence the result.
+	t.Setenv(githubClientIDEnv, "")
+	t.Setenv(githubClientSecretEnv, "")
+
+	t.Run("config only", func(t *testing.T) {
+		t.Setenv(githubClientIDEnv, "")
+		t.Setenv(githubClientSecretEnv, "cfg-secret")
+		gh, ok := GitHubOAuthFromEnv("cfg-client", oauthRedirectURL)
+		if !ok {
+			t.Fatal("config client id with env secret must configure")
+		}
+		if gh.ClientID != "cfg-client" {
+			t.Fatalf("ClientID = %q, want %q", gh.ClientID, "cfg-client")
+		}
+		if gh.ClientSecret != "cfg-secret" {
+			t.Fatalf("ClientSecret = %q, want %q", gh.ClientSecret, "cfg-secret")
+		}
+	})
+
+	t.Run("env only", func(t *testing.T) {
+		t.Setenv(githubClientIDEnv, "env-client")
+		t.Setenv(githubClientSecretEnv, "env-secret")
+		gh, ok := GitHubOAuthFromEnv("", oauthRedirectURL)
+		if !ok {
+			t.Fatal("env client id with env secret must configure")
+		}
+		if gh.ClientID != "env-client" {
+			t.Fatalf("ClientID = %q, want %q", gh.ClientID, "env-client")
+		}
+	})
+
+	t.Run("env takes precedence over config", func(t *testing.T) {
+		t.Setenv(githubClientIDEnv, "env-client")
+		t.Setenv(githubClientSecretEnv, "env-secret")
+		gh, ok := GitHubOAuthFromEnv("cfg-client", oauthRedirectURL)
+		if !ok {
+			t.Fatal("both sources set must configure")
+		}
+		if gh.ClientID != "env-client" {
+			t.Fatalf("ClientID = %q, want env-client to win", gh.ClientID)
+		}
+	})
+
+	t.Run("both empty", func(t *testing.T) {
+		t.Setenv(githubClientIDEnv, "")
+		t.Setenv(githubClientSecretEnv, "")
+		if gh, ok := GitHubOAuthFromEnv("", oauthRedirectURL); ok || gh != nil {
+			t.Fatalf("no credentials must yield unconfigured, got %+v", gh)
+		}
+	})
+}
+
+func TestGitHubOAuthFromEnvClientSecretRequired(t *testing.T) {
+	t.Setenv(githubClientIDEnv, "")
+	t.Setenv(githubClientSecretEnv, "")
+	// A client id without a secret is not enough — the secret must always come
+	// from the environment, matching the pre-existing behavior.
+	if gh, ok := GitHubOAuthFromEnv("cfg-client", oauthRedirectURL); ok || gh != nil {
+		t.Fatalf("missing client secret must yield unconfigured, got %+v", gh)
+	}
 }
 
 func TestGitHubOAuthNotConfigured(t *testing.T) {
