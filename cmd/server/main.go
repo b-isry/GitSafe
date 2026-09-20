@@ -62,6 +62,7 @@ func main() {
 		os.Exit(1)
 	}
 	baseURL := cfg.BaseURLOrDefault()
+	logger.Info("base URL configured", "baseURL", baseURL)
 	var oauth *server.GitHubOAuth
 	if gh, ok := server.GitHubOAuthFromEnv(cfg.GitHub.ClientID, baseURL); ok {
 		oauth = gh

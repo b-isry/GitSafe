@@ -158,10 +158,20 @@ func (c Config) Validate() error {
 	return nil
 }
 
+const baseURLEnv = "GITSAFE_BASE_URL"
+
 func (c *Config) expandEnv() {
 	c.OutputPath = os.ExpandEnv(c.OutputPath)
 	c.Cloud.CredentialsFile = os.ExpandEnv(c.Cloud.CredentialsFile)
-	c.BaseURL = os.ExpandEnv(c.BaseURL)
+
+	// GITSAFE_BASE_URL takes precedence over YAML baseUrl.
+	// If the env var is set, use it directly. Otherwise keep the YAML value
+	// and still expand any ${...} patterns within it.
+	if envBaseURL := os.Getenv(baseURLEnv); envBaseURL != "" {
+		c.BaseURL = envBaseURL
+	} else {
+		c.BaseURL = os.ExpandEnv(c.BaseURL)
+	}
 }
 
 // BaseURLOrDefault returns the configured base URL, defaulting to the local

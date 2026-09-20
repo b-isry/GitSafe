@@ -437,302 +437,16 @@ unrelated features, large refactors.
   Phase 4 limitation).
 - No automatic retry/resume of failed or interrupted jobs (by design, out of scope).
 
-## Phase 6 — Retention, Cleanup & Storage Lifecycle (COMPLETE)
+## Phase 6 & 7 — Retention, Cleanup, Scheduling & Notifications (REMOVED)
 
-### Scope
-Add a deterministic retention/cleanup system over the Phase 2-5 workflow
-(GitHub → protected repo → job → local bundle → optional Drive upload → persisted
-record/job state) so local bundles, backup records, jobs, orphans, and (optionally,
-explicitly) Drive copies do not grow without bound. Cleanup is manual, idempotent,
-restart-safe, concurrency-aware, and defaults to **refusing to delete** unless a
-retention policy explicitly opts in.
-
-### Goals / mapping to the prompt
-1. **Retention config** — new `config.RetentionConfig` on `Config`; conservative
-   defaults (all `0`/`false` = keep everything). Reused/parsed by settings Save +
-   Validate so unsafe values are rejected before they can cause destructive behavior.
-2. **Local retention** — a retention engine computes which recorded local bundles and
-   which orphan bundles are eligible, per a per-repo keep-count and/or keep-age policy.
-3. **Backup-record consistency** — after local deletion, a record whose Drive copy
-   remains stays `uploaded` (DriveFileID intact); a local-only (`bundled`) record whose
-   bundle is deleted is itself removed; a reconciliation pass removes records that
-   point to a missing local bundle AND no Drive copy. Uses existing statuses; no new
-   state added.
-4. **Drive retention** — separate and opt-in (`DriveRetentionEnabled` + `KeepDriveDays`).
-   Local deletion NEVER auto-deletes the Drive copy. Only files by our own persisted
-   `DriveFileID` are targeted; deletion is reported only when the provider confirms.
-   Reuses the Phase 4 service-account JWT architecture (new `cloud.DeleteFile`, no new
-   auth mechanism). After a confirmed Drive delete, the record is downgraded to
-   `bundled` + `DriveFileID` cleared.
-5. **Stale/orphan artifacts** — orphan bundle cleanup is restricted to files matching the
-   v2 protected-bundle naming convention (`<prefix>_<timestamp>_<hex>.bundle`, verified by
-   regex) AND unreferenced by any record AND whose owning repo has no unfinished job.
-   Unknown/legacy `.bundle` files not matching the v2 pattern are untouched. Record↔file
-   reconciliation (above) handles "records pointing to missing files."
-6. **Job-history cleanup** — `KeepJobs` retains the newest N *terminal* jobs
-   (completed/failed/interrupted) per repo; non-terminal (active) jobs are never removed.
-   Job removal is decoupled from bundle lifecycles (records own bundles).
-7. **Concurrency/safety** — the engine is serialized by a dedicated `cleanupMu` (so two
-   manual triggers do not double-run) and reads a job snapshot taken under the existing
-   `jobMu` (atomic with job creation). Records/files belonging to a repo with an
-   unfinished job are always skipped. Re-verification happens before deletion. This
-   closes the "discover A eligible → A becomes active → delete A" class: protected
-   backups use unique bundle filenames (Phase 5), so a new backup never reuses an
-   eligible record's name; and orphan/record deletion is gated on no unfinished job.
-   No broad global lock blocks normal backup operations.
-8. **Cleanup service boundary** — a testable `internal/retention` engine (pure planning +
-   injected fsops/drive/active callbacks) returns a `Result` with inspected/retained/
-   deleted/skipped/missing/orphan/jobs/errors breakdown. Server is a thin adapter.
-9. **Server/API** — `GET /api/retention` (current policy + last result), `PUT
-   /api/retention` (update policy; loopback + session + CSRF + validation), `POST
-   /api/retention/cleanup` (manual trigger; loopback + session + CSRF; returns Result).
-   Responses expose counts/bundle filenames/Drive ids, never raw filesystem paths.
-10. **UI** — retention numeric settings on the Settings page (persisted via the existing
-    config Save); a "Storage retention" panel + "Run cleanup" trigger + last-result
-    summary on the cloud-repositories page. Follows `DESIGN.md` and existing cloud/backup
-    UI; no unrelated redesign.
-
-### Out of scope
-Scheduled/cron cleanup, automatic backup scheduling, automatic retry infrastructure,
-Dropbox/OneDrive/S3/other providers, OAuth redesign, major UI redesign, rewriting
-encryption/token storage, refactoring the legacy local `BundleRepo` flow. Cleanup is a
-deterministic service a later scheduling phase could drive.
-
-### Retention policy model
-```
-retention:
-  keepLocal: 0            # max local backups (records+bundles) per repo; 0 = unlimited
-  keepLocalDays: 0        # max age in days of a local backup; 0 = unlimited
-  keepJobs: 0             # max terminal jobs retained per repo; 0 = unlimited
-  keepDriveDays: 0        # min age (days) a Drive copy must be to be deletable; 0 = never
-  driveRetentionEnabled: false  # must be true for ANY Drive deletion
-```
-Defaults keep everything (no unintended destructive behavior). A local bundle/record is
-locally eligible when it is beyond the keep-count cap OR older than keepLocalDays. A
-record is retained (not deleted) if it still has a Drive copy.
-
-### Validation (config.Validate + settings)
-- Reject negative values for all retention numeric fields (0 = off / unlimited).
-- Reject `driveRetentionEnabled=true` without `keepDriveDays>0` (a Drive policy that
-  could never match, or one that deletes unconditionally, is refused). Conservative.
-
-### Architecture mapping
-- **New package** `internal/retention` — pure, injectable engine (no HTTP/state-store
-  dependency beyond `state` types): `Policy`, `Policy.Validate`, `LocalBundle`,
-  `FSOps` (list/remove local bundles), `DriveDeleter`, `IsActiveRepo`, `Engine.Run`,
-  `Result`, `PlanLocal`, `PlanJobs`, `IsOrphanCandidate`. Exhaustively unit-tested.
-- **`internal/config/config.go`** — `RetentionConfig` on `Config`; `Defaults`, `Save`
-  (persist), `Validate`.
-- **`internal/cloud/drive.go`** — add `DeleteFile(ctx, cloudCfg, fileID, logger)` using
-  the service-account JWT (reuse). New `Server.driveDeleteFunc` seam (test stub).
-- **`internal/server/cleanup.go`** (new) — `Server.runCleanup`, the three API handlers,
-  policy view/result shaping, `cleanupMu`; `driveDeleteFunc` seam default.
-- **`internal/server/settings.go` + settings template** — retention fields in
-  `settingsInput`/`SettingsView`/`validateSettings`/`handleSaveSettings` + `config.Save`.
-- **`internal/server/server.go`** — register retention routes, add `server.driveDeleteFunc`
-  field + default in `New`.
-- **`internal/server/static/cloud.js` + `cloud-repositories.html`** — retention panel +
-  cleanup trigger + result.
-- **`internal/state`** — reuse `UpdateBackupRecord`, `RemoveBackupJob`, `BackupRecords`,
-  `BackupJobs`, `UnfinishedJobs`; **no schema change** (statuses already model remote /
-  local-only / missing).
-
-### Phase 6 status
-- [x] Read PLAN.md + inspect full Phase 2-5 implementation
-- [x] Persist scope/plan (this section)
-- [x] Retention config (model + defaults + validation + Save)
-- [x] `internal/retention` engine + unit tests
-- [x] Drive deletion (`cloud.DeleteFile` + `driveDeleteFunc` seam)
-- [x] Server handlers + routes + result shaping
-- [x] UI (retention panel + cleanup trigger on cloud-repositories page)
-- [x] Server-side integration + concurrency + idempotency tests
-- [x] Verification (`gofmt`, `build`, `vet`, `test`, `node --check`, `-race` attempted)
-- [x] Update work-state with results/limitations
-
-### Phase 6 results, limitations & notes
-Implemented and verified (all green):
-- **Retention config** — `config.RetentionConfig` (`keepLocal`, `keepLocalDays`,
-  `keepJobs`, `keepDriveDays`, `driveRetentionEnabled`) with all-zero/false defaults;
-  `Config.Validate()` rejects negatives and `driveRetentionEnabled` without `keepDriveDays>0`;
-  persisted through `config.Save`/`Load`.
-- **Engine** — `internal/retention` (pure, injectable `FSOps`/`DriveDeleter`/
-  `IsActiveRepo`/`IsActiveName`): per-repo keep-count and keep-age for local bundles,
-  record-removal for local-only records losing their bundle, record-keep for records with a
-  Drive copy, `reconcileRecords` (remove records with no Drive copy pointing at a missing
-  bundle), orphan cleanup restricted to the v2 bundle regex `^(.+)_\d{8}_\d{6}_[0-9a-f]{8}\.bundle$`,
-  job-history retention of the newest N terminal jobs, confirmed-only Drive deletion with
-  record downgrade to `bundled`. Disabled policy runs delete nothing.
-- **Drive deletion** — `cloud.DeleteFile` (service-account JWT, confirmed-only success);
-  `Server.driveDeleteFunc` seam + `defaultDriveDelete`, wired in `New`.
-- **State** — added `Store.RemoveBackupRecord` + `StateStore.RemoveBackupRecord`; no schema
-  change (reuses `bundled`/`uploaded`).
-- **Server/API** — `GET /api/retention`, `PUT /api/retention`, `POST /api/retention/cleanup`
-  (loopback + session + CSRF + validation; results/counts only, no raw paths). `runCleanup`
-  is serialized by `cleanupMu`, snapshots jobs under `jobMu`, skips repos with unfinished
-  jobs, tolerates a nil/unconfigured `stateStore` (returns an empty run), and applies state
-  mutations (record removal before downgrade).
-- **UI** — retention panel ("Keep local backups", "or days", "Keep job history", "Drive
-  copies older than", "Delete Drive copies too", Save + Run cleanup now + last-result
-  summary) on the cloud-repositories page; no paths exposed.
-- **Tests** — 13 retention-engine unit tests (by-count, by-age, both, uploaded-kept,
-  local-only-removed, missing bundle reconcile, already-deleted, orphan v2-only + referenced
-  kept, job history incl. active, active-repo skip, active-name skip, idempotency, drive
-  confirmed/failed/disabled) + `DiskFS` tests; 10 server integration tests (GET/PUT/cleanup
-  handlers, auth/CSRF, validation, eligible deletion, active-job skip, drive confirm +
-  downgrade, drive failure, disabled policy, concurrent serialized runs).
-- **Verification** — `gofmt -l .` clean; `go build ./...` OK; `go vet ./...` OK;
-  `go test -count=1 ./...` all packages pass; `node --check internal/server/static/cloud.js` OK.
-- **Limitations** — `go test -race` cannot run on this Windows box (`-race requires cgo`,
-  no C toolchain), same environmental limitation as Phase 5; the concurrent-cleanup test
-  still exercises serialized behavior but not under the race detector. Drive retention
-  requires the Phase 4 service-account credentials to be configured; until then the UI shows
-  "Drive is not configured". Cleanup is manual only (scheduling is out of scope).
-
-### Next phase (proposal)
-A scheduling/orchestration phase that drives the already-deterministic retention service on
-a timer/cron basis (e.g. `runCleanup` after each backup and on startup), plus optional
-notifications. Alternatively, encryption at rest of local bundles or a restore workflow.
-
-### Verification plan
-`gofmt -l .` clean; `go build ./...`; `go vet ./...`; `go test -count=1 ./...`;
-`node --check` on modified JS; `git status`/`git diff` only intended changes;
-`go test -race` attempted (document environmental limitation if cgo unavailable).
-
----
-
-## Phase 7 — Scheduling & Notifications (COMPLETE)
-
-### Scope
-Turn Phase 6's manual retention cleanup into an optional operational system: a
-testable scheduler that periodically calls the **existing** `runCleanup` engine
-(it is NOT a rewrite of Phase 6 — the scheduler decides *when* to clean, never
-*how*), with run-status observability, a minimal notifier abstraction, API/UI
-extensions for the "Scheduled Cleanup" section, and comprehensive deterministic
-tests. Scheduling is **off by default** so old config files (without the new
-fields) behave exactly as before.
-
-### Goals / mapping to the prompt
-1. **Config** — `Config.ScheduledCleanupEnabled bool` + `Config.ScheduledCleanupIntervalDays int`
-   (names per prompt; type/unit follows existing int-day retention conventions, confirmed
-   with the user). Defaults: disabled + `0`. `Validate()` rejects `ScheduledCleanupIntervalDays <= 0`
-   when enabled (negatives are refused like other retention numeric fields). Persisted through
-   the existing `Save`/`Load` (backward compatible — files without the field load disabled).
-2. **Scheduler** — new `internal/schedule` package (mirrors `internal/retention`): DI +
-   injectable clock/ticker, `Start()`/`Stop()`, skip-if-overlapping (a tick that fires while
-   the previous run is still active is coalesced/recorded, never runs concurrently), and clean
-   shutdown (no goroutine leaks, no app hang). No heavy third-party scheduler dependency.
-3. **Status model** — in-memory status: enabled, interval, running, last start/completion,
-   last result (reuse `retention.Result`), last trigger (`manual|scheduled`), success/failure,
-   a basic summary, and `nextRun` when determinable. Distinguishes manual vs scheduled runs.
-4. **Notifier** — `Notifier` abstraction (e.g. `NotifyCleanupResult(ctx, result, summary)`) with
-   a structured-logging implementation. A notification failure NEVER fails the cleanup.
-5. **API** — extend the existing `GET/PUT /api/retention` (no new endpoints): GET returns the
-   scheduling/status block; PUT accepts `scheduledCleanupEnabled` + `scheduledCleanupIntervalDays`,
-   validates, persists, and cleanly restarts/replaces the running scheduler on change. Loopback,
-   session, CSRF all preserved.
-6. **UI** — "Scheduled Cleanup" section in the cloud-repositories retention panel: enable
-   checkbox, interval (days) input, save, active indicator, last result, next run; degrades
-   gracefully when cloud isn't configured. Extend `cloud.js` (keep using `num()` / flash helpers).
-7. **Lifecycle** — add graceful shutdown to `cmd/server/main.go` (signal handling +
-   `http.Server.Shutdown` + scheduler `Stop`), satisfying "clean shutdown, no leaks, no hang".
-8. **Tests** — deterministic, fake-clock based (no `time.Sleep`/flaky time):
-   - `internal/schedule` unit tests: disabled, enabled interval, stop clean/leaks, no concurrent
-     exec, coalesced overlapping ticks, run error handling, notifier error tolerated, repeat
-     start/stop.
-   - config: defaults, valid, invalid (enabled+0, negative), persistence round-trip,
-     old-config-without-fields loads disabled.
-   - server: GET/PUT scheduling (auth/CSRF/validation intact), manual still works, enabled config
-     starts a scheduler, scheduler runs cleanup, notification failure doesn't fail cleanup,
-     config-change restarts scheduler, shutdown during a run is clean.
-
-### Out of scope
-Rewriting the Phase 6 retention engine; automatic backup scheduling (this only schedules
-cleanup); automatic retry of failed jobs; other notifier targets (email/Slack/webhook) beyond
-the slog implementation; changing auth/CSRF/loopback security; new providers; UI redesign.
-
-### Design decisions
-- **Interval type**: `int` days (`ScheduledCleanupIntervalDays`, yaml `scheduledCleanupIntervalDays`),
-  consistent with `keepLocalDays`/`keepDriveDays`; simplest to validate and display. A `time.Duration`
-  string would diverge from existing int-day config.
-- **Scheduler package**: `internal/schedule` with `Clock`/`Ticker` interfaces for DI and a
-  deterministic fake clock in tests.
-- **Replacing on config change**: on `PUT /api/retention` with scheduling changes, the server stops
-  the current scheduler and starts a new one reflecting the new config (started only when enabled).
-- **Lifecycle**: `main.go` gained graceful shutdown; the scheduler is created/wired after config
-  load and stopped on shutdown.
-- **Notifier**: `server.notifier`-style seam defaulting to a slog implementation; errors ignored.
-
-### Files to change
-- `internal/config/config.go` + `config_test.go` — scheduling fields, defaults, validate, Save/Load.
-- `internal/schedule/` (new) — `schedule.go` + `schedule_test.go` (fake clock).
-- `internal/server/cleanup.go` — extend `retentionView`/`retentionInput` + GET/PUT handlers with
-  scheduling + status; `runScheduledCleanup` wrapper; notifier + status fields.
-- `internal/server/server.go` — scheduler field + wiring, notifier field.
-- `internal/server/cleanup_test.go` — scheduling/status integration + concurrency tests.
-- `internal/server/static/cloud.js` + `templates/cloud-repositories.html` — "Scheduled Cleanup" section.
-- `cmd/server/main.go` — graceful shutdown + scheduler lifecycle.
-- `PLAN.md` — this document.
-
-### Phase 7 status
-- [x] Read PLAN.md + inspect full Phase 2-6 implementation
-- [x] Persist scope/plan (this section)
-- [x] Scheduling config (model + defaults + validation + Save/Load + tests)
-- [x] `internal/schedule` scheduler + unit tests (fake clock)
-- [x] Server status model + notifier + API extensions (GET/PUT)
-- [x] Scheduler lifecycle wiring + graceful shutdown in main.go
-- [x] UI (Scheduled Cleanup section + cloud.js)
-- [x] Server-side integration + concurrency + restart tests
-- [x] Verification (`gofmt`, `build`, `vet`, `test`, `node --check`, `-race` attempted)
-- [x] Update work-state with results/limitations
-
-### Results
-- **Config** (`internal/config/config.go`): `RetentionConfig` gains `ScheduledCleanupEnabled bool`
-  (yaml `scheduledCleanupEnabled`) + `ScheduledCleanupIntervalDays int` (yaml
-  `scheduledCleanupIntervalDays`). Defaults disabled/`0`. `Validate()` refuses negative intervals
-  and rejects `enabled` with interval `<= 0`. Persists via existing Save/Load; old configs load
-  disabled. Tests: `TestSchedulingDefaultsDisabled`, `TestSchedulingRoundTrip`,
-  `TestSchedulingOldConfigWithoutFields`, `TestSchedulingValidate` (10/10 in package pass).
-- **Scheduler** (`internal/schedule/schedule.go` + tests): `Clock`/`Ticker` interfaces (wall-clock
-  default), `Scheduler{Interval, Run, Clock}` with idempotent `Start()`/`Stop()`, guaranteed
-  non-overlapping runs (busy ticks dropped, serialized), error-tolerant loop, `Running()`, and
-  `Stop()` that waits for an in-flight run. `Start()` creates the ticker synchronously before
-  launching the goroutine (needed for deterministic fake-clock tests). 7/7 unit tests pass.
-- **Server** (`internal/server/cleanup_schedule.go` + `cleanup.go` + `server.go`): `cleanupStatus`
-  model + `scheduledView` JSON (`enabled`, `intervalDays`, `running`, `lastStart`, `lastFinish`,
-  `lastTrigger`, `success`, `nextRun`, `lastResult` embedding the full `retention.Result`).
-  `CleanupNotifier` interface + `slogNotifier` default; notification failures are logged, never
-  fail cleanup. `executeCleanup(ctx, trigger)` is the single manual/scheduled entry point,
-  serialized by the existing `cleanupMu`. `startSchedulerFor` replaces/stops the scheduler on
-  config change; `StartCleanupScheduler`/`StopCleanupScheduler` wire startup/shutdown.
-  GET `/api/retention` returns `scheduled`; PUT accepts/validates/persists the new fields,
-  restarts the scheduler, and still enforces auth + CSRF.
-- **Lifecycle** (`cmd/server/main.go`): `signal.NotifyContext` + `http.Server.Shutdown` (10s
-  timeout) + `StopCleanupScheduler()` on shutdown; `http.ErrServerClosed` tolerated.
-- **UI** (`templates/cloud-repositories.html` + `static/cloud.js`): "Scheduled cleanup" checkbox +
-  interval (days) input + status line (running / last run / next run / last-run errors); save and
-  manual-run handlers updated; `node --check` clean.
-- **Tests**: 10 new server tests in `cleanup_schedule_test.go` (scheduling defaults, enable/disable,
-  validation, scheduled run + status, notifier success/failure tolerance, manual trigger, stop-on-
-  disable with no resume, manual/scheduled serialization under `cleanupMu`, graceful stop during a
-  run, start-from-config). Deterministic via a fake clock + fake ticker; no sleeps.
-
-### Verification
-- `gofmt -l .` clean; `go build ./...` OK; `go vet ./...` clean; `go test -count=1 -timeout 180s ./...` all packages pass; `node --check internal/server/static/cloud.js` OK.
-- `go test -race` **not runnable here**: requires cgo (`CGO_ENABLED=1`) and no C compiler (`gcc`)
-  is installed on this Windows machine. Concurrency safety is covered by the deterministic
-  serialization tests mocking blocked runs. Run `-race` once a C toolchain is available.
-
-### Proposed next phase (Phase 8 candidates, for review)
-- Webhook/email notifiers behind the `CleanupNotifier` interface; notifier config in `config.yaml`.
-- Per-repo scheduling overrides; missed-run catch-up (run immediately if the process was down
-  across a boundary).
-- Persisted run history (which schedules, budgets) instead of in-memory `cleanupStatus`.
-- Add a C toolchain to CI and enable `go test -race` in the workflow.
-
-### Verification plan
-`gofmt -l .` clean; `go build ./...`; `go vet ./...`; `go test -count=1 ./...`;
-`node --check` on modified JS; `git status`/`git diff` only intended changes;
-`go test -race` attempted (document the known cgo limitation).
+The retention/cleanup system (local + Drive retention policy, manual cleanup
+trigger, orphan/job-history cleanup), the scheduled-cleanup orchestrator, and
+the webhook notification feature were removed in the v2 simplification: GitSafe
+is intentionally a simple pipeline (GitHub → protected repo → bundle → Drive
+upload) with no automatic deletion and no outbound notifications. The deleted
+code lived in `internal/retention`, `internal/schedule`, `internal/notify`,
+`internal/history`, `internal/server/cleanup*.go`, and the `config` retention /
+notification / per-repository-override fields.
 
 ---
 
@@ -746,6 +460,12 @@ policy, (3) bounded, atomic, persisted cleanup history, (4) race-detection CI,
 and (5) failure/recovery hardening (panic isolation at the scheduler boundary,
 secondary-failure isolation). Explicitly OUT of scope: rewriting the retention
 engine or scheduler, automatic backup scheduling, new providers, UI redesign.
+
+> Note: the notifier, per-repo override, cleanup-history, and scheduler-panic
+> components described in this phase were built on the retention system and were
+> removed with it (see Phase 6 & 7 note). Code preserved from this phase:
+> `decodeJSONBody` request guarding, batch caps, `backupSem`, atomic
+> `Config.Save`, the keyring token store, and the CI build/lint/test jobs.
 
 ### Design decisions (locked)
 - **Notifications**: top-level `Config.Notifications` (yaml `notifications`)
@@ -859,6 +579,12 @@ config persistence, (5) idempotency/recovery + lock-ordering audit, (6) global
 concurrency bounds on protected backups, (7) bounded network timeouts, and
 (8) CI lint/race jobs. Explicitly OUT of scope: UI redesign, new providers,
 rewriting the retention engine or scheduler.
+
+> Note: the SSRF/secret-hygiene guards, filesystem-safety checks, and Drive
+> file-ID validation targeted the removed webhook and retention/cleanup code.
+> Code preserved from this phase: `decodeJSONBody`, atomic `Config.Save`,
+> `backupSem`, `sanitizeMessage`, the keyring token store, and the CI
+> lint/race jobs.
 
 ### Design decisions (locked)
 - **SSRF**: webhook URLs validated with a guard set — default ports allowed

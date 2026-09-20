@@ -148,11 +148,23 @@ func TestConfigBaseURLOrDefault(t *testing.T) {
 		}
 	})
 
-	t.Run("uses configured value", func(t *testing.T) {
+	t.Run("uses configured YAML value when env not set", func(t *testing.T) {
+		t.Setenv("GITSAFE_BASE_URL", "")
 		cfg := Defaults()
-		cfg.BaseURL = "https://gitsafe.example.com"
-		if got := cfg.BaseURLOrDefault(); got != "https://gitsafe.example.com" {
-			t.Fatalf("BaseURLOrDefault = %q, want %q", got, "https://gitsafe.example.com")
+		cfg.BaseURL = "https://from-yaml.example.com"
+		cfg.expandEnv()
+		if got := cfg.BaseURLOrDefault(); got != "https://from-yaml.example.com" {
+			t.Fatalf("BaseURLOrDefault = %q, want %q", got, "https://from-yaml.example.com")
+		}
+	})
+
+	t.Run("env GITSAFE_BASE_URL takes precedence over YAML", func(t *testing.T) {
+		t.Setenv("GITSAFE_BASE_URL", "https://from-env.example.com")
+		cfg := Defaults()
+		cfg.BaseURL = "https://from-yaml.example.com"
+		cfg.expandEnv()
+		if got := cfg.BaseURLOrDefault(); got != "https://from-env.example.com" {
+			t.Fatalf("BaseURLOrDefault = %q, want %q (env should win)", got, "https://from-env.example.com")
 		}
 	})
 
@@ -164,13 +176,14 @@ func TestConfigBaseURLOrDefault(t *testing.T) {
 		}
 	})
 
-	t.Run("expands environment variable", func(t *testing.T) {
-		t.Setenv("GITSAFE_BASE_URL", "https://from-env.example.com")
+	t.Run("expands environment variable within YAML when env not set", func(t *testing.T) {
+		t.Setenv("GITSAFE_BASE_URL", "")
+		t.Setenv("MY_CUSTOM_URL", "https://custom.example.com")
 		cfg := Defaults()
-		cfg.BaseURL = "${GITSAFE_BASE_URL}"
+		cfg.BaseURL = "${MY_CUSTOM_URL}"
 		cfg.expandEnv()
-		if got := cfg.BaseURLOrDefault(); got != "https://from-env.example.com" {
-			t.Fatalf("BaseURLOrDefault = %q, want %q", got, "https://from-env.example.com")
+		if got := cfg.BaseURLOrDefault(); got != "https://custom.example.com" {
+			t.Fatalf("BaseURLOrDefault = %q, want %q", got, "https://custom.example.com")
 		}
 	})
 }
