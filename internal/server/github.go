@@ -33,6 +33,7 @@ type StateStore interface {
 	DriveConnection() (state.DriveConnection, bool)
 	SetDriveConnection(state.DriveConnection)
 	ClearDriveConnection()
+	ClearAll()
 	ProtectedRepos() []state.ProtectedRepo
 	ProtectedRepo(id string) (state.ProtectedRepo, bool)
 	AddProtectedRepo(r state.ProtectedRepo) error
@@ -98,12 +99,11 @@ func (s *Server) githubClientFor(token string) providers.Client {
 	return providers.NewGitHubProvider(token)
 }
 
-// ConfigureCloud wires the Phase 1 cloud integration (state, token store, and
-// optional GitHub OAuth) into the server. When oauth is nil, GitHub simply
-// appears disconnected and its endpoints report 503.
-func (s *Server) ConfigureCloud(stateStore StateStore, tokenStore TokenStore, oauth *GitHubOAuth) {
-	s.stateStore = stateStore
-	s.tokenStore = tokenStore
+// ConfigureCloud wires the Phase 1 GitHub OAuth into the server.
+// When oauth is nil, GitHub simply appears disconnected and its endpoints report 503.
+// Per-user state and token stores are managed by the UserStoreManager and accessed
+// via requireUser on each request.
+func (s *Server) ConfigureCloud(oauth *GitHubOAuth) {
 	s.github = oauth
 	if oauth != nil {
 		s.connectGitHub = func(ctx context.Context, code string) (string, []string, providers.Identity, error) {
@@ -211,12 +211,25 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.tokenStore.Set(tokenRefGitHub, token); err != nil {
+	// Create per-user stores for this user
+	userID := identity.ID
+	stores, err := s.userStores.getOrCreate(userID)
+	if err != nil {
+		s.oauthError(w, "could not create user stores")
+		return
+	}
+	stateStore := stores.state
+	tokenStore := stores.token
+
+	// Store the token in the per-user token store
+	if err := tokenStore.Set(tokenRefGitHub, token); err != nil {
+		s.logger.Error("github oauth: store access token", "cause", err)
 		s.oauthError(w, "could not store the access token securely")
 		return
 	}
 
-	s.stateStore.SetGitHubConnection(state.GitHubConnection{
+	// Create GitHub connection in the per-user state store
+	stateStore.SetGitHubConnection(state.GitHubConnection{
 		GitHubID:    identity.ID,
 		Login:       identity.Login,
 		Name:        identity.Name,
@@ -225,34 +238,43 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		ConnectedAt: time.Now(),
 		TokenRef:    tokenRefGitHub,
 	})
-	if err := s.saveState(); err != nil {
+	if err := s.saveState(stores.state); err != nil {
+		s.logger.Error("github oauth: persist connection state", "cause", err)
 		s.oauthError(w, "could not persist the connection state")
 		return
 	}
+
+	// Set the user ID in the session
+	sess.userID = userID
+	s.sessions.put(sess)
 
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 // handleAPIConnections lists the current cloud connections.
 func (s *Server) handleAPIConnections(w http.ResponseWriter, r *http.Request) {
+	_, stateStore, _, _, err := s.requireUser(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
+		return
+	}
+
 	github := map[string]any{
 		"connected":  false,
 		"provider":   "github",
 		"configured": s.github != nil,
 	}
-	if s.stateStore != nil {
-		if conn, ok := s.stateStore.GitHubConnection(); ok {
-			github["connected"] = true
-			github["login"] = conn.Login
-			github["githubId"] = conn.GitHubID
-			github["scopes"] = conn.Scopes
-		}
+	if conn, ok := stateStore.GitHubConnection(); ok {
+		github["connected"] = true
+		github["login"] = conn.Login
+		github["githubId"] = conn.GitHubID
+		github["scopes"] = conn.Scopes
 	}
 	drive := map[string]any{
-		"connected":  s.driveConnected(),
+		"connected":  s.driveConnected(stateStore),
 		"configured": s.driveConfigured(),
 	}
-	if dc, ok := s.driveConnection(); ok {
+	if dc, ok := s.driveConnection(stateStore); ok {
 		drive["accountEmail"] = dc.AccountEmail
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -267,8 +289,8 @@ func (s *Server) handleAPIConnections(w http.ResponseWriter, r *http.Request) {
 // deployment's client credentials, and a revocation failure never blocks the
 // disconnect.
 func (s *Server) handleDisconnectGitHub(w http.ResponseWriter, r *http.Request) {
-	sess := s.sessionFromRequest(r)
-	if sess == nil {
+	_, stateStore, tokenStore, sess, err := s.requireUser(r)
+	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{
 			"error": "No active session. Refresh the page and try again.",
 		})
@@ -282,19 +304,20 @@ func (s *Server) handleDisconnectGitHub(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var token string
-	if conn, ok := s.stateStore.GitHubConnection(); ok {
-		if t, err := s.tokenStore.Get(conn.TokenRef); err == nil {
+	if conn, ok := stateStore.GitHubConnection(); ok {
+		if t, err := tokenStore.Get(conn.TokenRef); err == nil {
 			token = t
 		}
-		if err := s.tokenStore.Delete(conn.TokenRef); err != nil {
+		if err := tokenStore.Delete(conn.TokenRef); err != nil {
+			s.logger.Error("github oauth: delete access token", "cause", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{
 				"error": "could not remove the access token",
 			})
 			return
 		}
-		s.stateStore.ClearGitHubConnection()
+		stateStore.ClearGitHubConnection()
 	}
-	if err := s.saveState(); err != nil {
+	if err := s.saveState(stateStore); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "could not persist the disconnect",
 		})
@@ -360,9 +383,9 @@ func (s *Server) handleCSRF(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"csrfToken": sess.csrf})
 }
 
-// saveState persists the state store, surfacing an error for the caller.
-func (s *Server) saveState() error {
-	return s.stateStore.Save()
+// saveState persists the given state store, surfacing an error for the caller.
+func (s *Server) saveState(stateStore StateStore) error {
+	return stateStore.Save()
 }
 
 // tokenRefGitHub is the tokenstore reference used for the GitHub primary token.

@@ -63,6 +63,18 @@ func (f *fakeStateStore) ClearDriveConnection() {
 	f.hasDrv = false
 }
 
+func (f *fakeStateStore) ClearAll() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gh = state.GitHubConnection{}
+	f.hasGh = false
+	f.drv = state.DriveConnection{}
+	f.hasDrv = false
+	f.protected = nil
+	f.records = nil
+	f.jobs = nil
+}
+
 func (f *fakeStateStore) BackupJobs() []state.BackupJob {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -234,11 +246,14 @@ func newCloudServer(t *testing.T, st *fakeStateStore, tk *fakeTokenStore, oauth 
 	if tk == nil {
 		tk = newFakeTokenStore()
 	}
-	if oauth == nil {
-		// Configuring without oauth still wires state/token so handlers work.
-		s.ConfigureCloud(st, tk, nil)
-	} else {
-		s.ConfigureCloud(st, tk, oauth)
+	// Bind the fake state/token stores to the canonical test user (42). Handlers
+	// resolve per-user stores via requireUser, so tests authenticate as user 42;
+	// never letting getOrCreate fall through to a live OS keychain during tests.
+	s.userStores.stores[42] = &userStores{state: st, token: tk}
+	s.ConfigureCloud(oauth)
+	// Default stub for repo size check: return 10 MB (under the 500 MB limit)
+	s.repoSize = func(ctx context.Context, fullName string) (int, error) {
+		return 10, nil
 	}
 	return s
 }
@@ -368,7 +383,8 @@ func TestGitHubOAuthNotConfigured(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("login status = %d, want 503", rec.Code)
 	}
-	rec = request(t, s, http.MethodGet, "/api/connections", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec = request(t, s, http.MethodGet, "/api/connections", cookie)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("connections status = %d, want 200", rec.Code)
 	}
@@ -384,7 +400,8 @@ func TestGitHubOAuthNotConfigured(t *testing.T) {
 
 func TestAppConnectionsReflectsNotConnected(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	rec := request(t, s, http.MethodGet, "/api/connections", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/connections", cookie)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
@@ -465,10 +482,11 @@ func TestGitHubCallbackSuccessPersists(t *testing.T) {
 }
 
 func TestGitHubCallbackMissingRepoScope(t *testing.T) {
-	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
+	st := &fakeStateStore{}
+	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
 	s.connectGitHub = func(ctx context.Context, code string) (string, []string, providers.Identity, error) {
 		// Token granted but WITHOUT the repo scope must be rejected.
-		return "tok", nil, providers.Identity{ID: 1, Login: "l", Scopes: []string{"public_repo"}}, nil
+		return "tok", nil, providers.Identity{ID: 42, Login: "l", Scopes: []string{"public_repo"}}, nil
 	}
 	cookie, stateVal, _ := loginAndGetState(t, s)
 	rec := request(t, s, http.MethodGet,
@@ -476,9 +494,11 @@ func TestGitHubCallbackMissingRepoScope(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (missing repo scope)", rec.Code)
 	}
-	st := s.stateStore.(*fakeStateStore)
-	if st.hasGh {
+	if _, ok := st.GitHubConnection(); ok {
 		t.Fatal("connection must not persist without repo scope")
+	}
+	if st.saved {
+		t.Fatal("state must not be saved without repo scope")
 	}
 }
 
@@ -487,7 +507,7 @@ func TestGitHubCallbackStateSingleUse(t *testing.T) {
 	tk := newFakeTokenStore()
 	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
 	s.connectGitHub = func(ctx context.Context, code string) (string, []string, providers.Identity, error) {
-		return "tok", []string{providers.ScopeRepo}, providers.Identity{ID: 2, Login: "u", Scopes: []string{providers.ScopeRepo}}, nil
+		return "tok", []string{providers.ScopeRepo}, providers.Identity{ID: 42, Login: "u", Scopes: []string{providers.ScopeRepo}}, nil
 	}
 	cookie, stateVal, _ := loginAndGetState(t, s)
 	path := "/api/auth/github/callback?state=" + stateVal + "&code=c"
@@ -509,19 +529,8 @@ func TestGitHubDisconnectClearsConnection(t *testing.T) {
 	tk.data[tokenstore.GitHubToken] = "tok"
 	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
 
-	// Establish a session and fetch a CSRF token.
-	csrf := request(t, s, http.MethodGet, "/api/csrf", nil)
-	var csrfBody map[string]string
-	_ = json.Unmarshal(csrf.Body.Bytes(), &csrfBody)
-	var cookie *http.Cookie
-	for _, c := range csrf.Result().Cookies() {
-		if c.Name == sessionCookieName {
-			cookie = c
-		}
-	}
-	if cookie == nil {
-		t.Fatal("no session cookie from /api/csrf")
-	}
+	// Establish an authenticated session and fetch its CSRF token.
+	cookie, csrf := authedCookie(t, s, 42)
 
 	// Attempt without a CSRF token → rejected.
 	noToken := request(t, s, http.MethodDelete, "/api/connections/github", cookie)
@@ -536,7 +545,7 @@ func TestGitHubDisconnectClearsConnection(t *testing.T) {
 	req := httptest.NewRequest(http.MethodDelete, "/api/connections/github", nil)
 	req.RemoteAddr = "127.0.0.1:55555"
 	req.AddCookie(cookie)
-	req.Header.Set("X-CSRF-Token", csrfBody["csrfToken"])
+	req.Header.Set("X-CSRF-Token", csrf)
 	rec := httptest.NewRecorder()
 	s.Routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -560,7 +569,8 @@ func TestGitHubDisconnectNoSession(t *testing.T) {
 
 func TestRepositoriesDisconnected(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	rec := request(t, s, http.MethodGet, "/api/repositories", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/repositories", cookie)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409", rec.Code)
 	}
@@ -571,7 +581,8 @@ func TestRepositoriesMissingToken(t *testing.T) {
 	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
 	// Token store empty → missing token.
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	rec := request(t, s, http.MethodGet, "/api/repositories", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/repositories", cookie)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
 	}
