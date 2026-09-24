@@ -4,14 +4,20 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/b-isry/gitsafe/internal/providers"
+	"github.com/b-isry/gitsafe/internal/state"
+	"github.com/b-isry/gitsafe/internal/tokenstore"
 )
 
 //go:embed templates static
@@ -23,13 +29,12 @@ type Server struct {
 	app        *App
 	configPath string
 
-	sessions *sessionManager
+	sessions   *sessionManager
+	userStores *UserStoreManager
 
 	// GitHub OAuth wiring (Phase 1). Optional: when unset, GitHub appears
 	// disconnected and OAuth endpoints report a 503 "not configured".
-	stateStore StateStore
-	tokenStore TokenStore
-	github     *GitHubOAuth
+	github *GitHubOAuth
 	// connectGitHub performs the OAuth code exchange and identity lookup. It is
 	// a function field (set by ConfigureCloud) so tests can stub it without
 	// network access.
@@ -68,6 +73,10 @@ type Server struct {
 	// default calls cloud.UploadFile. It is only invoked when Drive is enabled.
 	driveUpload driveUploadFunc
 
+	// repoSize returns the size of a repository in MB. It is a function field
+	// so tests can stub the GitHub API call without network access.
+	repoSize repoSizeFunc
+
 	// jobMu serializes protected-backup job creation so a repository is never
 	// given two concurrent jobs.
 	jobMu sync.Mutex
@@ -82,6 +91,16 @@ type Server struct {
 	// Progress is intentionally never persisted to state or disk.
 	jobProgressMu sync.Mutex
 	jobProgress   map[string]jobProgressMetrics
+
+	// userBackupMu guards userBackups, which tracks how many backups are
+	// currently running per user (GitHub ID). Enforces one backup per user.
+	userBackupMu sync.Mutex
+	userBackups  map[int64]int
+
+	// disablePerUserBackupLimit is a test-only flag to disable the one-backup-per-user limit.
+	// It is not set in production and is only used by tests that need to verify
+	// global concurrency limits without the per-user restriction.
+	disablePerUserBackupLimit bool
 }
 
 type pageData struct {
@@ -92,6 +111,93 @@ type pageData struct {
 type renderData struct {
 	pageData
 	Cloud CloudView
+}
+
+// UserStoreManager manages per-user state and token stores.
+// Each user gets their own isolated state file and token namespace.
+type UserStoreManager struct {
+	mu       sync.RWMutex
+	stores   map[int64]*userStores
+	basePath string
+	logger   *slog.Logger
+}
+
+type userStores struct {
+	state StateStore
+	token TokenStore
+}
+
+// UserStoreManager creates a new manager for per-user stores.
+// basePath is the directory where per-user state files will be stored (e.g., ".gitsafe").
+func NewUserStoreManager(basePath string, logger *slog.Logger) *UserStoreManager {
+	return &UserStoreManager{
+		stores:   make(map[int64]*userStores),
+		basePath: basePath,
+		logger:   logger,
+	}
+}
+
+// getOrCreate returns the per-user stores for the given GitHub user ID.
+// It creates them on first access.
+func (m *UserStoreManager) getOrCreate(userID int64) (*userStores, error) {
+	m.mu.RLock()
+	if stores, ok := m.stores[userID]; ok {
+		m.mu.RUnlock()
+		return stores, nil
+	}
+	m.mu.RUnlock()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	if stores, ok := m.stores[userID]; ok {
+		return stores, nil
+	}
+
+	// Create per-user state file path: .gitsafe/state-{userID}.json
+	statePath := filepath.Join(m.basePath, fmt.Sprintf("state-%d.json", userID))
+	st, err := state.Open(statePath)
+	if err != nil {
+		return nil, fmt.Errorf("open user state store: %w", err)
+	}
+
+	tokenStore := tokenstore.New()
+
+	stores := &userStores{
+		state: st,
+		token: tokenStore,
+	}
+	m.stores[userID] = stores
+	return stores, nil
+}
+
+// requireUser extracts the authenticated user from the request session.
+// Returns the user's GitHub ID, state store, token store, and session.
+// If no valid session or no authenticated user, returns an error.
+func (s *Server) requireUser(r *http.Request) (int64, StateStore, TokenStore, *session, error) {
+	sess := s.sessionFromRequest(r)
+	if sess == nil {
+		return 0, nil, nil, nil, fmt.Errorf("no session")
+	}
+	if sess.userID == 0 {
+		return 0, nil, nil, nil, fmt.Errorf("no authenticated user")
+	}
+	stores, err := s.userStores.getOrCreate(sess.userID)
+	if err != nil {
+		return 0, nil, nil, nil, err
+	}
+	return sess.userID, stores.state, stores.token, sess, nil
+}
+
+// requireUserOrZero is like requireUser but returns zero values instead of error
+// for handlers that need to render different content for authenticated vs unauthenticated users.
+func (s *Server) requireUserOrZero(r *http.Request) (int64, StateStore, TokenStore, *session) {
+	userID, st, tok, sess, err := s.requireUser(r)
+	if err != nil {
+		return 0, nil, nil, nil
+	}
+	return userID, st, tok, sess
 }
 
 var pages = []string{cloudRepositoriesPage}
@@ -113,15 +219,24 @@ func New(logger *slog.Logger, app *App, configPath string) (*Server, error) {
 	if configPath == "" {
 		configPath = ConfigPathFile
 	}
+	// Determine base path for per-user state files
+	// Use the directory of the config file, or default to .gitsafe
+	basePath := filepath.Dir(configPath)
+	if basePath == "." {
+		basePath = ".gitsafe"
+	}
 	srv := &Server{
 		tmpls:        tmpls,
 		logger:       logger,
 		app:          app,
 		configPath:   configPath,
 		sessions:     newSessionManager(),
+		userStores:   NewUserStoreManager(basePath, logger),
 		bundleBackup: defaultBundleBackup,
 		backupSem:    make(chan struct{}, maxConcurrentBackups),
 		jobProgress:  make(map[string]jobProgressMetrics),
+		userBackups:  make(map[int64]int),
+		repoSize:     nil, // nil means use default implementation
 	}
 	srv.githubLister = func(ctx context.Context, token string) ([]providers.Repository, error) {
 		return srv.githubClientFor(token).ListRepositories(ctx)
@@ -139,35 +254,58 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
 	mux.HandleFunc("/", s.handleCloudRepositories)
 
+	// Health check endpoint (no rate limiting, no auth)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// Rate limiting middleware
+	apiLimiter := s.rateLimitMiddleware(
+		s.app.Config.RateLimitRequests,
+		time.Duration(s.app.Config.RateLimitWindowSeconds)*time.Second,
+		s.getRateLimitKey,
+	)
+	authLimiter := s.rateLimitMiddleware(
+		s.app.Config.AuthRateLimitRequests,
+		time.Duration(s.app.Config.AuthRateLimitWindowSeconds)*time.Second,
+		s.getRateLimitKey,
+	)
+
 	// Phase 1: GitHub OAuth and cloud connections.
-	mux.Handle("GET /api/csrf", s.loopback(s.handleCSRF))
-	mux.Handle("GET /api/auth/github", s.loopback(s.handleGitHubLogin))
-	mux.Handle("GET /api/auth/github/callback", s.loopback(s.handleGitHubCallback))
-	mux.Handle("GET /api/connections", s.loopback(s.handleAPIConnections))
-	mux.Handle("GET /api/repositories", s.loopback(s.handleAPIRepositories))
-	mux.Handle("DELETE /api/connections/github", s.loopback(s.handleDisconnectGitHub))
+	mux.Handle("GET /api/csrf", authLimiter(s.loopback(s.handleCSRF)))
+	mux.Handle("GET /api/auth/github", authLimiter(s.loopback(s.handleGitHubLogin)))
+	mux.Handle("GET /api/auth/github/callback", authLimiter(s.loopback(s.handleGitHubCallback)))
+	mux.Handle("GET /api/connections", apiLimiter(s.loopback(s.handleAPIConnections)))
+	mux.Handle("GET /api/repositories", apiLimiter(s.loopback(s.handleAPIRepositories)))
+	mux.Handle("DELETE /api/connections/github", apiLimiter(s.loopback(s.handleDisconnectGitHub)))
+
+	// Auth: logout and account deletion
+	mux.Handle("POST /api/auth/logout", apiLimiter(s.loopback(s.handleLogout)))
+	mux.Handle("POST /api/account/delete", apiLimiter(s.loopback(s.handleDeleteAccount)))
 
 	// Drive OAuth and connection management.
-	mux.Handle("GET /api/auth/drive", s.loopback(s.handleDriveLogin))
-	mux.Handle("GET /api/auth/drive/callback", s.loopback(s.handleDriveCallback))
-	mux.Handle("DELETE /api/connections/drive", s.loopback(s.handleDisconnectDrive))
+	mux.Handle("GET /api/auth/drive", authLimiter(s.loopback(s.handleDriveLogin)))
+	mux.Handle("GET /api/auth/drive/callback", authLimiter(s.loopback(s.handleDriveCallback)))
+	mux.Handle("DELETE /api/connections/drive", apiLimiter(s.loopback(s.handleDisconnectDrive)))
 
 	// Legacy protection endpoints, retained so existing tooling keeps working.
 	// The dashboard no longer uses the protect/protected model.
-	mux.Handle("GET /api/protected-repositories", s.loopback(s.handleListProtectedRepositories))
-	mux.Handle("POST /api/protected-repositories", s.loopback(s.handleProtectRepositories))
-	mux.Handle("DELETE /api/protected-repositories/{id}", s.loopback(s.handleRemoveProtectedRepository))
+	mux.Handle("GET /api/protected-repositories", apiLimiter(s.loopback(s.handleListProtectedRepositories)))
+	mux.Handle("POST /api/protected-repositories", apiLimiter(s.loopback(s.handleProtectRepositories)))
+	mux.Handle("DELETE /api/protected-repositories/{id}", apiLimiter(s.loopback(s.handleRemoveProtectedRepository)))
 
 	// Direct backup flow: any GitHub repository can be backed up without being
 	// protected first, and "back up all" sweeps every repository directly.
-	mux.Handle("POST /api/repositories/{githubId}/backup", s.loopback(s.handleBackupRepo))
-	mux.Handle("POST /api/backups", s.loopback(s.handleBackupAll))
+	mux.Handle("POST /api/repositories/{githubId}/backup", apiLimiter(s.loopback(s.handleBackupRepo)))
+	mux.Handle("POST /api/backups", apiLimiter(s.loopback(s.handleBackupAll)))
 
 	// Phase 3: backup execution and job/history inspection.
-	mux.Handle("POST /api/protected-repositories/{id}/backup", s.loopback(s.handleBackupProtectedRepo))
-	mux.Handle("GET /api/backup-jobs/{id}", s.loopback(s.handleProtectedBackupJob))
-	mux.Handle("GET /api/protected-repositories/{id}/backup-jobs", s.loopback(s.handleProtectedBackupJobs))
-	mux.Handle("GET /api/protected-repositories/{id}/backups", s.loopback(s.handleProtectedBackupHistory))
+	mux.Handle("POST /api/protected-repositories/{id}/backup", apiLimiter(s.loopback(s.handleBackupProtectedRepo)))
+	mux.Handle("GET /api/backup-jobs/{id}", apiLimiter(s.loopback(s.handleProtectedBackupJob)))
+	mux.Handle("GET /api/protected-repositories/{id}/backup-jobs", apiLimiter(s.loopback(s.handleProtectedBackupJobs)))
+	mux.Handle("GET /api/protected-repositories/{id}/backups", apiLimiter(s.loopback(s.handleProtectedBackupHistory)))
 
 	return mux
 }
@@ -198,6 +336,69 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// handleLogout destroys the current session.
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	sess := s.sessionFromRequest(r)
+	if sess == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session"})
+		return
+	}
+	if !validateCSRF(sess, r.Header.Get("X-CSRF-Token")) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "CSRF validation failed"})
+		return
+	}
+	s.sessions.remove(sess.id)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
+}
+
+// handleDeleteAccount revokes OAuth grants, deletes user data, and destroys the session.
+func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
+	_, stateStore, tokenStore, sess, err := s.requireUser(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session"})
+		return
+	}
+	if !validateCSRF(sess, r.Header.Get("X-CSRF-Token")) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "CSRF validation failed"})
+		return
+	}
+
+	// Get GitHub connection for revocation
+	conn, ok := stateStore.GitHubConnection()
+	if ok && s.revokeToken != nil {
+		if token, err := tokenStore.Get(conn.TokenRef); err == nil {
+			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+			_ = s.revokeToken(ctx, token)
+			cancel()
+		}
+	}
+
+	// Revoke Drive token
+	if driveConn, ok := s.driveConnection(stateStore); ok && s.driveRevoke != nil {
+		if token, err := tokenStore.Get(driveConn.TokenRef); err == nil {
+			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+			_ = s.driveRevoke(ctx, token)
+			cancel()
+		}
+	}
+
+	// Delete user's data directory
+	userDataDir := filepath.Join(s.app.OutputPath, fmt.Sprintf("user-%d", conn.GitHubID))
+	_ = os.RemoveAll(userDataDir)
+
+	// Clear state store
+	stateStore.ClearGitHubConnection()
+	stateStore.ClearDriveConnection()
+	// Remove all protected repos, backup records, and jobs for this user
+	// (In a real implementation, we'd filter by user; for now clear all)
+	stateStore.ClearAll()
+
+	// Destroy session
+	s.sessions.remove(sess.id)
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "account deleted"})
 }
 
 // maxRequestBody bounds every JSON request body so a damaged or malicious local

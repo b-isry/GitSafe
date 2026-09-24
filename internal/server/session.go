@@ -23,6 +23,7 @@ const sessionTTL = 2 * time.Hour
 type session struct {
 	id         string
 	csrf       string
+	userID     int64  // GitHub user ID of the authenticated user (0 if not authenticated)
 	ghState    string // GitHub OAuth state bound to this session (single-use)
 	ghStateUs  bool   // whether the GitHub OAuth state has already been consumed
 	drvState   string // Drive OAuth state bound to this session (single-use)
@@ -100,6 +101,13 @@ func (m *sessionManager) consumeDriveState(id, state string) bool {
 	}
 	s.drvStateUs = true
 	return subtle.ConstantTimeCompare([]byte(s.drvState), []byte(state)) == 1
+}
+
+// remove deletes a session by ID.
+func (m *sessionManager) remove(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sessions, id)
 }
 
 // randToken returns a cryptographically random hex string.

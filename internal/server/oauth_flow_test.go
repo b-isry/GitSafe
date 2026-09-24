@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -82,9 +81,10 @@ func TestCloudRepositoriesPageConnected(t *testing.T) {
 	tk := newFakeTokenStore()
 	tk.data[tokenstore.GitHubToken] = "tok"
 	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
+	cookie, _ := authedCookie(t, s, 42)
 
 	for _, path := range []string{"/", "/api/connections"} {
-		rec := request(t, s, http.MethodGet, path, nil)
+		rec := request(t, s, http.MethodGet, path, cookie)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s status = %d, want 200", path, rec.Code)
 		}
@@ -283,8 +283,9 @@ func TestSecretNeverInAPIResponses(t *testing.T) {
 		return []providers.Repository{{ID: 1, FullName: "a/b"}}, nil
 	}
 
+	cookie, _ := authedCookie(t, s, 42)
 	for _, path := range []string{"/api/connections", "/api/repositories", "/api/protected-repositories"} {
-		rec := request(t, s, http.MethodGet, path, nil)
+		rec := request(t, s, http.MethodGet, path, cookie)
 		body := rec.Body.String()
 		assertNoDevLeak(t, path, body)
 		if strings.Contains(body, "supersecret") {
@@ -297,22 +298,11 @@ func TestSecretNeverInAPIResponses(t *testing.T) {
 // DELETE to /api/connections/github carrying the CSRF token.
 func disconnectWithCSRF(t *testing.T, s *Server) *httptest.ResponseRecorder {
 	t.Helper()
-	csrf := request(t, s, http.MethodGet, "/api/csrf", nil)
-	var csrfBody map[string]string
-	_ = json.Unmarshal(csrf.Body.Bytes(), &csrfBody)
-	var cookie *http.Cookie
-	for _, c := range csrf.Result().Cookies() {
-		if c.Name == sessionCookieName {
-			cookie = c
-		}
-	}
-	if cookie == nil {
-		t.Fatal("no session cookie from /api/csrf")
-	}
+	cookie, csrf := authedCookie(t, s, 42)
 	req := httptest.NewRequest(http.MethodDelete, "/api/connections/github", nil)
 	req.RemoteAddr = "127.0.0.1:55555"
 	req.AddCookie(cookie)
-	req.Header.Set("X-CSRF-Token", csrfBody["csrfToken"])
+	req.Header.Set("X-CSRF-Token", csrf)
 	rec := httptest.NewRecorder()
 	s.Routes().ServeHTTP(rec, req)
 	return rec
