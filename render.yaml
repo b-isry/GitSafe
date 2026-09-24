@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: gitsafe
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    region: oregon
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: GITSAFE_BASE_URL
+        sync: false
+      - key: GITSAFE_GITHUB_CLIENT_ID
+        sync: false
+      - key: GITSAFE_GITHUB_CLIENT_SECRET
+        sync: false
+      - key: GITSAFE_DRIVE_CLIENT_ID
+        sync: false
+      - key: GITSAFE_DRIVE_CLIENT_SECRET
+        sync: false
+      - key: GITSAFE_TOKEN_KEY
+        sync: false
+      - key: GITSAFE_DATA_DIR
+        value: /var/data
+    # Note: Persistent disks require a paid plan on Render.
+    # Add a disk to the service and mount it at /var/data for persistent storage.
+    # The service should be limited to a single instance (scaling not supported with single disk).
+    disk:
+      name: gitsafe-data
+      mountPath: /var/data
+      sizeGB: 10
