@@ -16,13 +16,17 @@ import (
 // envCloudServer builds a server with the Phase 1 cloud wiring attached. When
 // enabled, it also configures the Drive OAuth application and seeds a connected
 // Drive account (refresh token in the keychain, connection in state).
-func envCloudServer(t *testing.T, st *fakeStateStore, enabled bool) *Server {
+func envCloudServer(t *testing.T, st *fakeStateStore, enabled bool) (*Server, *fakeTokenStore) {
 	t.Helper()
 	tk := newFakeTokenStore()
 	tk.data[tokenstore.GitHubToken] = "tok"
 	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
 
 	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
+	// Stub repo size check to return a small size (10 MB) for testing
+	s.repoSize = func(ctx context.Context, fullName string) (int, error) {
+		return 10, nil
+	}
 	if enabled {
 		s.ConfigureDriveOAuth(&DriveOAuth{
 			ClientID:     "drive-id",
@@ -37,7 +41,7 @@ func envCloudServer(t *testing.T, st *fakeStateStore, enabled bool) *Server {
 			TokenRef:        tokenstore.DriveToken,
 		})
 	}
-	return s
+	return s, tk
 }
 
 func seedDriveJob(t *testing.T, st *fakeStateStore) state.ProtectedRepo {
@@ -59,7 +63,7 @@ func stubDriveBundler(s *Server) {
 func TestRunProtectedBackupUploadSuccess(t *testing.T) {
 	st := &fakeStateStore{}
 	repo := seedDriveJob(t, st)
-	s := envCloudServer(t, st, true)
+	s, tk := envCloudServer(t, st, true)
 	stubDriveBundler(s)
 	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
 		if bundlePath != "/out/acme_alpha.bundle" {
@@ -74,7 +78,8 @@ func TestRunProtectedBackupUploadSuccess(t *testing.T) {
 		return "drive-file-123", nil
 	}
 
-	s.runProtectedBackup("j1", repo)
+	userID := int64(42)
+	s.runProtectedBackup(userID, st, tk, "j1", repo)
 
 	job, ok := st.BackupJob("j1")
 	if !ok || job.State != state.JobCompleted {
@@ -99,13 +104,14 @@ func TestRunProtectedBackupUploadSuccess(t *testing.T) {
 func TestRunProtectedBackupUploadFailure(t *testing.T) {
 	st := &fakeStateStore{}
 	repo := seedDriveJob(t, st)
-	s := envCloudServer(t, st, true)
+	s, tk := envCloudServer(t, st, true)
 	stubDriveBundler(s)
 	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
 		return "", errBoom
 	}
 
-	s.runProtectedBackup("j1", repo)
+	userID := int64(42)
+	s.runProtectedBackup(userID, st, tk, "j1", repo)
 
 	job, ok := st.BackupJob("j1")
 	if !ok || job.State != state.JobFailed {
@@ -126,7 +132,7 @@ func TestRunProtectedBackupUploadFailure(t *testing.T) {
 func TestRunProtectedBackupDriveNotConnected(t *testing.T) {
 	st := &fakeStateStore{}
 	repo := seedDriveJob(t, st)
-	s := envCloudServer(t, st, false)
+	s, tk := envCloudServer(t, st, false)
 	uploaded := false
 	stubDriveBundler(s)
 	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
@@ -134,7 +140,8 @@ func TestRunProtectedBackupDriveNotConnected(t *testing.T) {
 		return "never", nil
 	}
 
-	s.runProtectedBackup("j1", repo)
+	userID := int64(42)
+	s.runProtectedBackup(userID, st, tk, "j1", repo)
 
 	if uploaded {
 		t.Fatal("driveUpload should not be called when Drive is not connected")
@@ -156,7 +163,7 @@ func TestRunProtectedBackupDriveNotConnected(t *testing.T) {
 func TestRunProtectedBackupReachesUploading(t *testing.T) {
 	st := &fakeStateStore{}
 	repo := seedDriveJob(t, st)
-	s := envCloudServer(t, st, true)
+	s, tk := envCloudServer(t, st, true)
 	stubDriveBundler(s)
 	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
 		job, ok := st.BackupJob("j1")
@@ -166,7 +173,8 @@ func TestRunProtectedBackupReachesUploading(t *testing.T) {
 		return "drive-x", nil
 	}
 
-	s.runProtectedBackup("j1", repo)
+	userID := int64(42)
+	s.runProtectedBackup(userID, st, tk, "j1", repo)
 
 	job, _ := st.BackupJob("j1")
 	if job.State != state.JobCompleted {
@@ -179,7 +187,7 @@ func TestRunProtectedBackupReachesUploading(t *testing.T) {
 func TestRunProtectedBackupNoRecordBeforeUploadSuccess(t *testing.T) {
 	st := &fakeStateStore{}
 	repo := seedDriveJob(t, st)
-	s := envCloudServer(t, st, true)
+	s, tk := envCloudServer(t, st, true)
 	stubDriveBundler(s)
 	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
 		if records := st.BackupRecordsForRepo("p1"); len(records) != 0 {
@@ -188,7 +196,8 @@ func TestRunProtectedBackupNoRecordBeforeUploadSuccess(t *testing.T) {
 		return "drive-z", nil
 	}
 
-	s.runProtectedBackup("j1", repo)
+	userID := int64(42)
+	s.runProtectedBackup(userID, st, tk, "j1", repo)
 
 	job, ok := st.BackupJob("j1")
 	if !ok || job.State != state.JobCompleted {
@@ -202,8 +211,9 @@ func TestRunProtectedBackupNoRecordBeforeUploadSuccess(t *testing.T) {
 // TestAPIConnectionsDriveConfigured verifies the connections endpoint reports a
 // connected Drive account.
 func TestAPIConnectionsDriveConfigured(t *testing.T) {
-	s := envCloudServer(t, &fakeStateStore{}, true)
-	rec := request(t, s, http.MethodGet, "/api/connections", nil)
+	s, _ := envCloudServer(t, &fakeStateStore{}, true)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/connections", cookie)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
@@ -215,8 +225,9 @@ func TestAPIConnectionsDriveConfigured(t *testing.T) {
 // TestAPIConnectionsDriveNotConfigured verifies Drive reports unconfigured when
 // the deployment has no Drive OAuth application registered.
 func TestAPIConnectionsDriveNotConfigured(t *testing.T) {
-	s := envCloudServer(t, &fakeStateStore{}, false)
-	rec := request(t, s, http.MethodGet, "/api/connections", nil)
+	s, _ := envCloudServer(t, &fakeStateStore{}, false)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/connections", cookie)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}

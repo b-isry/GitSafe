@@ -108,7 +108,8 @@ func TestAPIRepositoriesBackupStatus(t *testing.T) {
 		providers.Repository{ID: 44, FullName: "fresh/new", DefaultBranch: "main"},
 	)
 
-	rec := request(t, s, http.MethodGet, "/api/repositories", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/repositories", cookie)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
@@ -159,11 +160,11 @@ func TestAPIRepositoriesBackupStatus(t *testing.T) {
 
 func TestBackupRepoAcceptedWithoutProtection(t *testing.T) {
 	st := &fakeStateStore{}
-	s := envCloudServer(t, st, true)
+	s, _ := envCloudServer(t, st, true)
 	stubDiscovery(s, providers.Repository{ID: 100, FullName: "acme/alpha", DefaultBranch: "main"})
 	stubQuickBackend(s)
 
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := postBackup(t, s, cookie, csrf, "/api/repositories/100/backup", nil)
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202: %s", rec.Code, rec.Body.String())
@@ -189,9 +190,9 @@ func TestBackupRepoAcceptedWithoutProtection(t *testing.T) {
 }
 
 func TestBackupRepoNotFoundOnGitHub(t *testing.T) {
-	s := envCloudServer(t, &fakeStateStore{}, true)
+	s, _ := envCloudServer(t, &fakeStateStore{}, true)
 	stubDiscovery(s, providers.Repository{ID: 100, FullName: "acme/alpha"})
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := postBackup(t, s, cookie, csrf, "/api/repositories/999/backup", nil)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
@@ -199,8 +200,8 @@ func TestBackupRepoNotFoundOnGitHub(t *testing.T) {
 }
 
 func TestBackupRepoBadID(t *testing.T) {
-	s := envCloudServer(t, &fakeStateStore{}, true)
-	cookie, csrf := csrfCookie(t, s)
+	s, _ := envCloudServer(t, &fakeStateStore{}, true)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := postBackup(t, s, cookie, csrf, "/api/repositories/not-a-number/backup", nil)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
@@ -208,7 +209,7 @@ func TestBackupRepoBadID(t *testing.T) {
 }
 
 func TestBackupRepoNoSession(t *testing.T) {
-	s := envCloudServer(t, &fakeStateStore{}, true)
+	s, _ := envCloudServer(t, &fakeStateStore{}, true)
 	rec := postBackup(t, s, nil, "", "/api/repositories/100/backup", nil)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
@@ -216,8 +217,8 @@ func TestBackupRepoNoSession(t *testing.T) {
 }
 
 func TestBackupRepoMissingCSRF(t *testing.T) {
-	s := envCloudServer(t, &fakeStateStore{}, true)
-	cookie, _ := csrfCookie(t, s)
+	s, _ := envCloudServer(t, &fakeStateStore{}, true)
+	cookie, _ := authedCookie(t, s, 42)
 	rec := postBackup(t, s, cookie, "", "/api/repositories/100/backup", nil)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
@@ -226,7 +227,8 @@ func TestBackupRepoMissingCSRF(t *testing.T) {
 
 func TestBackupRepoNotConfigured(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), nil)
-	rec := postBackup(t, s, nil, "", "/api/repositories/100/backup", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := postBackup(t, s, cookie, "", "/api/repositories/100/backup", nil)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
@@ -236,9 +238,9 @@ func TestBackupRepoInFlight(t *testing.T) {
 	st := &fakeStateStore{}
 	st.protected = []state.ProtectedRepo{{ID: "p1", GitHubID: 100, FullName: "acme/alpha"}}
 	st.jobs = []state.BackupJob{{ID: "j1", ProtectedRepoID: "p1", FullName: "acme/alpha", State: state.JobCloning}}
-	s := envCloudServer(t, st, true)
+	s, _ := envCloudServer(t, st, true)
 	stubDiscovery(s, providers.Repository{ID: 100, FullName: "acme/alpha", DefaultBranch: "main"})
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := postBackup(t, s, cookie, csrf, "/api/repositories/100/backup", nil)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409", rec.Code)
@@ -249,7 +251,7 @@ func TestBackupRepoDriveNotConnected(t *testing.T) {
 	st := &fakeStateStore{}
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
 	stubDiscovery(s, providers.Repository{ID: 100, FullName: "acme/alpha", DefaultBranch: "main"})
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := postBackup(t, s, cookie, csrf, "/api/repositories/100/backup", nil)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (Drive required)", rec.Code)
@@ -260,14 +262,14 @@ func TestBackupRepoDriveNotConnected(t *testing.T) {
 
 func TestBackupAllStartsJobsForEveryRepo(t *testing.T) {
 	st := &fakeStateStore{}
-	s := envCloudServer(t, st, true)
+	s, _ := envCloudServer(t, st, true)
 	stubDiscovery(s,
 		providers.Repository{ID: 1, FullName: "acme/one", DefaultBranch: "main"},
 		providers.Repository{ID: 2, FullName: "acme/two", DefaultBranch: "main"},
 	)
 	stubQuickBackend(s)
 
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := postBackup(t, s, cookie, csrf, "/api/backups", nil)
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202: %s", rec.Code, rec.Body.String())
@@ -294,14 +296,14 @@ func TestBackupAllSkipsInFlightRepo(t *testing.T) {
 	st := &fakeStateStore{}
 	st.protected = []state.ProtectedRepo{{ID: "p1", GitHubID: 1, FullName: "acme/one"}}
 	st.jobs = []state.BackupJob{{ID: "j1", ProtectedRepoID: "p1", FullName: "acme/one", State: state.JobCloning}}
-	s := envCloudServer(t, st, true)
+	s, _ := envCloudServer(t, st, true)
 	stubDiscovery(s,
 		providers.Repository{ID: 1, FullName: "acme/one", DefaultBranch: "main"},
 		providers.Repository{ID: 2, FullName: "acme/two", DefaultBranch: "main"},
 	)
 	stubQuickBackend(s)
 
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := postBackup(t, s, cookie, csrf, "/api/backups", nil)
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202", rec.Code)
@@ -316,7 +318,7 @@ func TestBackupAllSkipsInFlightRepo(t *testing.T) {
 }
 
 func TestBackupAllNoSession(t *testing.T) {
-	s := envCloudServer(t, &fakeStateStore{}, true)
+	s, _ := envCloudServer(t, &fakeStateStore{}, true)
 	rec := postBackup(t, s, nil, "", "/api/backups", nil)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
@@ -324,8 +326,8 @@ func TestBackupAllNoSession(t *testing.T) {
 }
 
 func TestBackupAllMissingCSRF(t *testing.T) {
-	s := envCloudServer(t, &fakeStateStore{}, true)
-	cookie, _ := csrfCookie(t, s)
+	s, _ := envCloudServer(t, &fakeStateStore{}, true)
+	cookie, _ := authedCookie(t, s, 42)
 	rec := postBackup(t, s, cookie, "", "/api/backups", nil)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
@@ -334,7 +336,8 @@ func TestBackupAllMissingCSRF(t *testing.T) {
 
 func TestBackupAllNotConfigured(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), nil)
-	rec := postBackup(t, s, nil, "", "/api/backups", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := postBackup(t, s, cookie, "", "/api/backups", nil)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
@@ -344,7 +347,7 @@ func TestBackupAllDriveNotConnected(t *testing.T) {
 	st := &fakeStateStore{}
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
 	stubDiscovery(s, providers.Repository{ID: 1, FullName: "acme/one", DefaultBranch: "main"})
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := postBackup(t, s, cookie, csrf, "/api/backups", nil)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (Drive required)", rec.Code)

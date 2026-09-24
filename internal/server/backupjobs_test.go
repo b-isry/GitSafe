@@ -36,7 +36,8 @@ func seedProtectedRepo(st *fakeStateStore, id, fullName, branch string) state.Pr
 
 func TestBackupProtectedRepoNotConfigured(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), nil)
-	rec := postProtectedBackup(t, s, nil, "", "p1")
+	cookie, _ := authedCookie(t, s, 42)
+	rec := postProtectedBackup(t, s, cookie, "", "p1")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
@@ -52,7 +53,7 @@ func TestBackupProtectedRepoNoSession(t *testing.T) {
 
 func TestBackupProtectedRepoMissingCSRF(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	cookie, _ := csrfCookie(t, s)
+	cookie, _ := authedCookie(t, s, 42)
 	rec := postProtectedBackup(t, s, cookie, "", "p1")
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
@@ -62,7 +63,7 @@ func TestBackupProtectedRepoMissingCSRF(t *testing.T) {
 func TestBackupProtectedRepoUnknown(t *testing.T) {
 	st := &fakeStateStore{}
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := postProtectedBackup(t, s, cookie, csrf, "nope")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
@@ -72,11 +73,11 @@ func TestBackupProtectedRepoUnknown(t *testing.T) {
 func TestBackupProtectedRepoAccepted(t *testing.T) {
 	st := &fakeStateStore{}
 	seedProtectedRepo(st, "p1", "acme/alpha", "main")
-	s := envCloudServer(t, st, true)
+	s, _ := envCloudServer(t, st, true)
 	s.bundleBackup = func(ctx context.Context, fullName, token, output string) (bundleOutcome, error) {
 		return bundleOutcome{BundlePath: "x.bundle", BundleName: "x.bundle", SizeBytes: 5, SHA256: "abc"}, nil
 	}
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := postProtectedBackup(t, s, cookie, csrf, "p1")
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202", rec.Code)
@@ -98,7 +99,7 @@ func TestBackupProtectedRepoDuplicate(t *testing.T) {
 	seedProtectedRepo(st, "p1", "acme/alpha", "main")
 	st.jobs = []state.BackupJob{{ID: "j1", ProtectedRepoID: "p1", FullName: "acme/alpha", State: state.JobCloning}}
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := postProtectedBackup(t, s, cookie, csrf, "p1")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409", rec.Code)
@@ -107,7 +108,8 @@ func TestBackupProtectedRepoDuplicate(t *testing.T) {
 
 func TestBackupJobNotConfigured(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), nil)
-	rec := request(t, s, http.MethodGet, "/api/backup-jobs/j1", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/backup-jobs/j1", cookie)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
@@ -115,7 +117,8 @@ func TestBackupJobNotConfigured(t *testing.T) {
 
 func TestBackupJobUnknown(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	rec := request(t, s, http.MethodGet, "/api/backup-jobs/nope", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/backup-jobs/nope", cookie)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
@@ -126,7 +129,8 @@ func TestProtectedBackupJobsList(t *testing.T) {
 	seedProtectedRepo(st, "p1", "acme/alpha", "main")
 	st.jobs = []state.BackupJob{{ID: "j1", ProtectedRepoID: "p1", State: state.JobCompleted}}
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	rec := request(t, s, http.MethodGet, "/api/protected-repositories/p1/backup-jobs", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/protected-repositories/p1/backup-jobs", cookie)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -146,7 +150,8 @@ func TestProtectedBackupHistory(t *testing.T) {
 	seedProtectedRepo(st, "p1", "acme/alpha", "main")
 	st.records = []state.BackupRecord{{ID: "r1", ProtectedRepoID: "p1", FullName: "acme/alpha", BundleName: "a.bundle", BundleSize: 12, Status: "uploaded"}}
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	rec := request(t, s, http.MethodGet, "/api/protected-repositories/p1/backups", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/protected-repositories/p1/backups", cookie)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -163,7 +168,8 @@ func TestProtectedBackupHistory(t *testing.T) {
 
 func TestProtectedBackupHistoryUnknownRepo(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	rec := request(t, s, http.MethodGet, "/api/protected-repositories/nope/backups", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/protected-repositories/nope/backups", cookie)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
@@ -176,7 +182,7 @@ func TestRunProtectedBackupSuccess(t *testing.T) {
 	repo := seedProtectedRepo(st, "p1", "acme/alpha", "main")
 	st.CreateBackupJob(state.BackupJob{ID: "j1", ProtectedRepoID: "p1", FullName: repo.FullName, State: state.JobEnqueued})
 
-	s := envCloudServer(t, st, true)
+	s, tk := envCloudServer(t, st, true)
 	s.bundleBackup = func(ctx context.Context, fullName, token, output string) (bundleOutcome, error) {
 		if token != "tok" {
 			t.Fatalf("bundler token = %q", token)
@@ -193,7 +199,8 @@ func TestRunProtectedBackupSuccess(t *testing.T) {
 		return "drive-file-123", nil
 	}
 
-	s.runProtectedBackup("j1", repo)
+	userID := int64(42)
+	s.runProtectedBackup(userID, st, tk, "j1", repo)
 
 	done := false
 	for _, j := range st.BackupJobs() {
@@ -225,11 +232,12 @@ func TestRunProtectedBackupBundlerFailure(t *testing.T) {
 	repo := seedProtectedRepo(st, "p1", "acme/alpha", "main")
 	st.CreateBackupJob(state.BackupJob{ID: "j1", ProtectedRepoID: "p1", FullName: repo.FullName, State: state.JobEnqueued})
 
-	s := envCloudServer(t, st, true)
+	s, tk := envCloudServer(t, st, true)
 	s.bundleBackup = func(ctx context.Context, fullName, token, output string) (bundleOutcome, error) {
 		return bundleOutcome{}, errBoom
 	}
-	s.runProtectedBackup("j1", repo)
+	userID := int64(42)
+	s.runProtectedBackup(userID, st, tk, "j1", repo)
 
 	job, ok := st.BackupJob("j1")
 	if !ok || job.State != state.JobFailed {
@@ -249,7 +257,10 @@ func TestRunProtectedBackupDisconnected(t *testing.T) {
 	st.CreateBackupJob(state.BackupJob{ID: "j1", ProtectedRepoID: "p1", FullName: repo.FullName, State: state.JobEnqueued})
 
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	s.runProtectedBackup("j1", repo)
+	userID := int64(42)
+	stores, _ := s.userStores.getOrCreate(userID)
+	tk := stores.token.(*fakeTokenStore)
+	s.runProtectedBackup(userID, st, tk, "j1", repo)
 
 	job, ok := st.BackupJob("j1")
 	if !ok || job.State != state.JobFailed {

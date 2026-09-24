@@ -19,7 +19,9 @@ func TestBackupConcurrencyCapped(t *testing.T) {
 	for i := 0; i < total; i++ {
 		seedProtectedRepo(st, string(rune('a'+i)), "acme/repo-"+string(rune('a'+i)), "main")
 	}
-	s := envCloudServer(t, st, true)
+	s, tk := envCloudServer(t, st, true)
+	// Disable per-user backup limit to test global semaphore
+	s.disablePerUserBackupLimit = true
 	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
 		return "drive-x", nil
 	}
@@ -38,7 +40,7 @@ func TestBackupConcurrencyCapped(t *testing.T) {
 	}
 
 	for i := 0; i < total; i++ {
-		if _, err := s.startProtectedBackup(string(rune('a' + i))); err != nil {
+		if _, err := s.startProtectedBackup(int64(42), st, tk, string(rune('a'+i))); err != nil {
 			t.Fatalf("start %d: %v", i, err)
 		}
 	}

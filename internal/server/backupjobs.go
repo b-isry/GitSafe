@@ -36,11 +36,10 @@ type bundleOutcome struct {
 type bundleBackupFunc func(ctx context.Context, fullName, token, outputPath string) (bundleOutcome, error)
 
 // defaultBundleBackup mirrors a protected GitHub repository and writes a git
-// bundle to outputPath. The tokenized clone URL is built at runtime and is
-// never persisted.
+// bundle to outputPath. The clone URL is built on the server from the validated
+// fullName; the token is passed via git's environment config (never in URL/argv).
 func defaultBundleBackup(ctx context.Context, fullName, token, outputPath string) (bundleOutcome, error) {
-	cloneURL := fmt.Sprintf("https://x-access-token:%s@github.com/%s.git", token, fullName)
-	bundlePath, err := archiver.BundleRemoteRepo(cloneURL, outputPath)
+	bundlePath, err := archiver.BundleRemoteRepo(ctx, fullName, token, outputPath)
 	if err != nil {
 		return bundleOutcome{}, err
 	}
@@ -82,6 +81,11 @@ func sha256File(path string) (string, error) {
 // job orchestration so tests can stub the network/Google work.
 type driveUploadFunc func(ctx context.Context, bundlePath, folderID, driveToken string, onProgress func(now, total int64), logger *slog.Logger) (string, error)
 
+// repoSizeFunc returns the size of a repository in MB. It is a function field
+// so tests can stub the GitHub API call without network access.
+// The token is obtained from the per-user token store.
+type repoSizeFunc func(ctx context.Context, fullName string) (int, error)
+
 // sanitizeMessage strips credentials from a message before it is persisted or
 // returned to the client. It guards against any code path leaking a tokenized
 // URL (e.g. an auth token embedded in an error), independent of upstream
@@ -98,15 +102,15 @@ var tokenURLPattern = regexp.MustCompile(`(?i)([a-z][a-z0-9+.\-]*://)[^@\s]*@`)
 // startProtectedBackup enqueues a backup job for the given protected repository
 // and runs it detached from any HTTP request. It returns the created job, or an
 // error if the repository is unknown or already being backed up.
-func (s *Server) startProtectedBackup(protectedRepoID string) (state.BackupJob, error) {
-	repo, ok := s.stateStore.ProtectedRepo(protectedRepoID)
+func (s *Server) startProtectedBackup(userID int64, stateStore StateStore, tokenStore TokenStore, protectedRepoID string) (state.BackupJob, error) {
+	repo, ok := stateStore.ProtectedRepo(protectedRepoID)
 	if !ok {
 		return state.BackupJob{}, errProtectedRepoNotFound
 	}
 
 	s.jobMu.Lock()
 	defer s.jobMu.Unlock()
-	for _, j := range s.stateStore.UnfinishedJobs() {
+	for _, j := range stateStore.UnfinishedJobs() {
 		if j.ProtectedRepoID == protectedRepoID {
 			return state.BackupJob{}, errJobInFlight
 		}
@@ -114,7 +118,7 @@ func (s *Server) startProtectedBackup(protectedRepoID string) (state.BackupJob, 
 
 	// Drive is the only valid backup destination. Fail at request time with a
 	// clear message when no Google Drive account is connected.
-	if !s.driveConnected() {
+	if !s.driveConnected(stateStore) {
 		return state.BackupJob{}, errDriveNotConnected
 	}
 
@@ -126,12 +130,12 @@ func (s *Server) startProtectedBackup(protectedRepoID string) (state.BackupJob, 
 		State:           state.JobEnqueued,
 		StartedAt:       now,
 	}
-	s.stateStore.CreateBackupJob(job)
-	if err := s.saveState(); err != nil {
+	stateStore.CreateBackupJob(job)
+	if err := s.saveState(stateStore); err != nil {
 		// Persisting the freshly-created job failed. Remove it so it does not
 		// linger as an orphaned non-terminal job that blocks future backups of
 		// this repository (409) until a restart.
-		if rerr := s.stateStore.RemoveBackupJob(job.ID); rerr != nil {
+		if rerr := stateStore.RemoveBackupJob(job.ID); rerr != nil {
 			s.logger.Warn("cleanup orphaned job after save failure", "job", job.ID, "error", rerr)
 		}
 		return state.BackupJob{}, err
@@ -142,7 +146,7 @@ func (s *Server) startProtectedBackup(protectedRepoID string) (state.BackupJob, 
 		// serialization is unchanged (jobMu guarantees one job per repo).
 		s.backupSem <- struct{}{}
 		defer func() { <-s.backupSem }()
-		s.runProtectedBackup(job.ID, repo)
+		s.runProtectedBackup(userID, stateStore, tokenStore, job.ID, repo)
 	}()
 	return job, nil
 }
@@ -154,61 +158,112 @@ const maxConcurrentBackups = 4
 var (
 	errProtectedRepoNotFound = fmt.Errorf("protected repository not found")
 	errJobInFlight           = fmt.Errorf("a backup for this repository is already running")
+	errUserBackupInFlight    = fmt.Errorf("a backup is already running for this user")
+	errRepoTooLarge          = fmt.Errorf("repository exceeds maximum allowed size")
+	errMaxProtectedRepos     = fmt.Errorf("maximum number of protected repositories reached")
 )
 
 // runProtectedBackup walks a single backup job through its lifecycle, persisting
 // every transition. A background context is used so the job survives the client
 // disconnecting after the 202 response.
-func (s *Server) runProtectedBackup(jobID string, repo state.ProtectedRepo) {
-	ctx := context.Background()
+func (s *Server) runProtectedBackup(userID int64, stateStore StateStore, tokenStore TokenStore, jobID string, repo state.ProtectedRepo) {
 	bg := s.logger
 
 	getJob := func() state.BackupJob {
-		j, _ := s.stateStore.BackupJob(jobID)
+		j, _ := stateStore.BackupJob(jobID)
 		return j
 	}
 	setState := func(st string) {
 		j := getJob()
 		j.State = st
-		if err := s.stateStore.UpdateBackupJob(j); err != nil {
+		if err := stateStore.UpdateBackupJob(j); err != nil {
 			bg.Warn("update backup job state", "job", jobID, "state", st, "error", err)
 			return
 		}
-		if err := s.saveState(); err != nil {
+		if err := s.saveState(stateStore); err != nil {
 			bg.Warn("persist backup job state", "job", jobID, "state", st, "error", err)
 		}
 	}
 
-	conn, ok := s.stateStore.GitHubConnection()
+	// Get GitHub connection and token
+	conn, ok := stateStore.GitHubConnection()
 	if !ok {
-		s.finishProtectedJob(jobID, repo, "GitHub is not connected")
+		s.finishProtectedJob(stateStore, jobID, repo, "GitHub is not connected")
 		return
 	}
-	token, err := s.tokenStore.Get(conn.TokenRef)
+	token, err := tokenStore.Get(conn.TokenRef)
 	if err != nil {
-		s.finishProtectedJob(jobID, repo, "GitHub access token is unavailable")
+		s.finishProtectedJob(stateStore, jobID, repo, "GitHub access token is unavailable")
 		return
 	}
 
-	// Google Drive is the only valid backup destination: without a connected
-	// account a backup cannot complete. Re-checked here (in addition to the
-	// request-time check) so a disconnect mid-flight fails cleanly too.
-	driveConn, ok := s.driveConnection()
+	// Google Drive is the only valid backup destination
+	driveConn, ok := s.driveConnection(stateStore)
 	if !ok {
-		s.finishProtectedJob(jobID, repo, errDriveNotConnected.Error()+". Connect your Google account and try again.")
+		s.finishProtectedJob(stateStore, jobID, repo, errDriveNotConnected.Error()+". Connect your Google account and try again.")
 		return
 	}
-	refreshToken, err := s.tokenStore.Get(driveConn.TokenRef)
+	refreshToken, err := tokenStore.Get(driveConn.TokenRef)
 	if err != nil || refreshToken == "" {
-		s.finishProtectedJob(jobID, repo, "Google Drive access token is unavailable. Reconnect your account and try again.")
+		s.finishProtectedJob(stateStore, jobID, repo, "Google Drive access token is unavailable. Reconnect your account and try again.")
 		return
 	}
 
-	// Stage the bundle in a temporary directory so no permanent local copy
-	// survives a finished backup. The temporary directory is always removed.
+	// Acquire per-user backup slot (unless disabled for testing)
+	if !s.disablePerUserBackupLimit {
+		s.userBackupMu.Lock()
+		if s.userBackups[userID] > 0 {
+			s.userBackupMu.Unlock()
+			s.finishProtectedJob(stateStore, jobID, repo, errUserBackupInFlight.Error())
+			return
+		}
+		s.userBackups[userID]++
+		s.userBackupMu.Unlock()
+
+		// Defer releasing the user backup slot
+		defer func() {
+			s.userBackupMu.Lock()
+			if s.userBackups[userID] > 0 {
+				s.userBackups[userID]--
+			}
+			if s.userBackups[userID] == 0 {
+				delete(s.userBackups, userID)
+			}
+			s.userBackupMu.Unlock()
+		}()
+	}
+
+	// Create timeout context for clone+bundle phase
+	timeoutMinutes := s.app.Config.BackupTimeoutMinutes
+	if timeoutMinutes <= 0 {
+		timeoutMinutes = 20
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMinutes)*time.Minute)
+	defer cancel()
+
+	// Check repo size before cloning (use a short timeout for the API call)
+	sizeCtx, sizeCancel := context.WithTimeout(ctx, 30*time.Second)
+	repoSizeMB, err := s.checkRepoSize(sizeCtx, tokenStore, repo.FullName)
+	sizeCancel()
+	if err != nil {
+		bg.Error("failed to check repo size", "job", jobID, "repo", repo.FullName, "error", err)
+		s.finishProtectedJob(stateStore, jobID, repo, "failed to check repository size: "+err.Error())
+		return
+	}
+	maxRepoMB := s.app.Config.MaxRepoMB
+	if maxRepoMB <= 0 {
+		maxRepoMB = 500
+	}
+	if repoSizeMB > maxRepoMB {
+		bg.Warn("repository too large", "job", jobID, "repo", repo.FullName, "sizeMB", repoSizeMB, "maxMB", maxRepoMB)
+		s.finishProtectedJob(stateStore, jobID, repo, fmt.Sprintf("repository size (%d MB) exceeds maximum allowed (%d MB)", repoSizeMB, maxRepoMB))
+		return
+	}
+
+	// Stage the bundle in a temporary directory
 	staging, err := os.MkdirTemp("", "gitsafe-staging-*")
 	if err != nil {
-		s.finishProtectedJob(jobID, repo, "could not create a temporary staging directory")
+		s.finishProtectedJob(stateStore, jobID, repo, "could not create a temporary staging directory")
 		return
 	}
 	defer os.RemoveAll(staging)
@@ -217,7 +272,7 @@ func (s *Server) runProtectedBackup(jobID string, repo state.ProtectedRepo) {
 	outcome, err := s.bundleBackup(ctx, repo.FullName, token, staging)
 	if err != nil {
 		bg.Error("protected backup failed", "job", jobID, "repo", repo.FullName, "error", err)
-		s.finishProtectedJob(jobID, repo, "backup failed: "+err.Error())
+		s.finishProtectedJob(stateStore, jobID, repo, "backup failed: "+err.Error())
 		return
 	}
 
@@ -226,25 +281,18 @@ func (s *Server) runProtectedBackup(jobID string, repo state.ProtectedRepo) {
 	driveID, err := s.driveUpload(ctx, outcome.BundlePath, driveConn.StorageFolderID, refreshToken, func(now, total int64) {
 		s.setJobProgress(jobID, jobProgressMetrics{UploadedBytes: now, TotalBytes: total})
 	}, s.logger)
-	// Upload progress is live-only: it is cleared once the upload ends so
-	// terminal jobs never report bytes.
 	s.clearJobProgress(jobID)
 	if err != nil {
-		// Upload failed: remove the staged bundle (best-effort) so no local
-		// copy lingers, then fail the job with no backup record.
 		bg.Error("drive upload failed", "job", jobID, "repo", repo.FullName, "bundle", outcome.BundleName, "error", err)
 		_ = os.Remove(outcome.BundlePath)
-		s.finishProtectedJob(jobID, repo, "drive upload failed: "+err.Error())
+		s.finishProtectedJob(stateStore, jobID, repo, "drive upload failed: "+err.Error())
 		return
 	}
 
-	// Upload succeeded: the temporary local bundle is no longer needed.
 	if err := os.Remove(outcome.BundlePath); err != nil {
 		bg.Warn("remove temporary bundle after upload", "job", jobID, "bundle", outcome.BundlePath, "error", err)
 	}
 
-	// The backup record exists only for completed Drive uploads: every visible
-	// backup is a real Drive copy.
 	setState(state.JobRecording)
 	record := state.BackupRecord{
 		ID:              uuid.NewString(),
@@ -259,23 +307,23 @@ func (s *Server) runProtectedBackup(jobID string, repo state.ProtectedRepo) {
 		DriveFileID:     driveID,
 		Status:          state.BackupStatusUploaded,
 	}
-	s.stateStore.AddBackupRecord(record)
+	stateStore.AddBackupRecord(record)
 
 	j := getJob()
 	j.State = state.JobCompleted
 	j.FinishedAt = time.Now()
-	if err := s.stateStore.UpdateBackupJob(j); err != nil {
+	if err := stateStore.UpdateBackupJob(j); err != nil {
 		bg.Warn("complete backup job", "job", jobID, "error", err)
 	}
-	if err := s.saveState(); err != nil {
+	if err := s.saveState(stateStore); err != nil {
 		bg.Warn("persist completed backup job", "job", jobID, "error", err)
 	}
 	bg.Info("protected backup completed", "job", jobID, "repo", repo.FullName, "bundle", outcome.BundleName, "driveFileID", driveID)
 }
 
 // finishProtectedJob marks a job failed with a sanitized message and persists it.
-func (s *Server) finishProtectedJob(jobID string, repo state.ProtectedRepo, message string) {
-	j, ok := s.stateStore.BackupJob(jobID)
+func (s *Server) finishProtectedJob(stateStore StateStore, jobID string, repo state.ProtectedRepo, message string) {
+	j, ok := stateStore.BackupJob(jobID)
 	if !ok {
 		return
 	}
@@ -283,24 +331,48 @@ func (s *Server) finishProtectedJob(jobID string, repo state.ProtectedRepo, mess
 	j.State = state.JobFailed
 	j.FinishedAt = time.Now()
 	j.Error = message
-	if err := s.stateStore.UpdateBackupJob(j); err != nil {
+	if err := stateStore.UpdateBackupJob(j); err != nil {
 		s.logger.Warn("fail backup job", "job", jobID, "error", err)
 	}
-	if err := s.saveState(); err != nil {
+	if err := s.saveState(stateStore); err != nil {
 		s.logger.Warn("persist failed backup job", "job", jobID, "error", err)
 	}
+}
+
+// checkRepoSize queries the GitHub API for the repository size in MB.
+// Returns the size in MB, or an error if the repository cannot be found.
+func (s *Server) checkRepoSize(ctx context.Context, tokenStore TokenStore, fullName string) (int, error) {
+	if s.repoSize != nil {
+		return s.repoSize(ctx, fullName)
+	}
+	// Get the GitHub token from the per-user token store
+	token, err := tokenStore.Get(tokenRefGitHub)
+	if err != nil {
+		return 0, err
+	}
+	client := s.githubClientFor(token)
+	repo, err := client.Repository(ctx, fullName)
+	if err != nil {
+		return 0, err
+	}
+	// GitHub API returns size in KB
+	sizeKB := repo.SizeKB
+	if sizeKB <= 0 {
+		return 0, nil
+	}
+	return int((sizeKB + 1023) / 1024), nil
 }
 
 // --- handlers ---
 
 // handleBackupProtectedRepo triggers a backup for a single protected repository.
 func (s *Server) handleBackupProtectedRepo(w http.ResponseWriter, r *http.Request) {
-	if !s.cloudReady(w) {
+	userID, stateStore, tokenStore, sess, err := s.requireUser(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
 		return
 	}
-	sess := s.sessionFromRequest(r)
-	if sess == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
+	if !s.cloudReady(w, userID, stateStore, tokenStore) {
 		return
 	}
 	if !validateCSRF(sess, r.Header.Get("X-CSRF-Token")) {
@@ -309,7 +381,7 @@ func (s *Server) handleBackupProtectedRepo(w http.ResponseWriter, r *http.Reques
 	}
 
 	id := r.PathValue("id")
-	job, err := s.startProtectedBackup(id)
+	job, err := s.startProtectedBackup(userID, stateStore, tokenStore, id)
 	switch {
 	case err == errProtectedRepoNotFound:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "protected repository not found"})
@@ -323,6 +395,7 @@ func (s *Server) handleBackupProtectedRepo(w http.ResponseWriter, r *http.Reques
 		})
 		return
 	case err != nil:
+		s.logger.Error("start protected backup", "cause", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not start the backup"})
 		return
 	}
@@ -335,11 +408,15 @@ func (s *Server) handleBackupProtectedRepo(w http.ResponseWriter, r *http.Reques
 // backup engine's internal per-repository record on demand, then delegates to
 // the existing backup machinery (startProtectedBackup) unchanged.
 func (s *Server) handleBackupRepo(w http.ResponseWriter, r *http.Request) {
-	if !s.cloudReady(w) {
+	userID, stateStore, tokenStore, sess, err := s.requireUser(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
 		return
 	}
-	sess := s.sessionFromRequest(r)
-	if sess == nil {
+	if !s.cloudReady(w, userID, stateStore, tokenStore) {
+		return
+	}
+	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
 		return
 	}
@@ -354,7 +431,7 @@ func (s *Server) handleBackupRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	repos, err := s.discoverRepositories(r)
+	repos, err := s.discoverRepositories(r.Context(), stateStore, tokenStore)
 	if err != nil {
 		s.writeDiscoveryError(w, err)
 		return
@@ -371,14 +448,14 @@ func (s *Server) handleBackupRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	internalRepo, err := s.findOrCreateInternalRepo(found.ID, found.FullName, found.DefaultBranch)
+	internalRepo, err := s.findOrCreateInternalRepo(stateStore, found.ID, found.FullName, found.DefaultBranch)
 	if err != nil {
 		s.logger.Warn("ensure internal repo record", "repo", found.FullName, "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not start the backup"})
 		return
 	}
 
-	job, err := s.startProtectedBackup(internalRepo.ID)
+	job, err := s.startProtectedBackup(userID, stateStore, tokenStore, internalRepo.ID)
 	switch {
 	case err == errJobInFlight:
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "A backup for this repository is already running."})
@@ -402,26 +479,26 @@ func (s *Server) handleBackupRepo(w http.ResponseWriter, r *http.Request) {
 // it). Drive connectivity is required, since the engine only writes to Drive;
 // in-flight repositories are skipped, not treated as errors.
 func (s *Server) handleBackupAll(w http.ResponseWriter, r *http.Request) {
-	if !s.cloudReady(w) {
+	userID, stateStore, tokenStore, sess, err := s.requireUser(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
 		return
 	}
-	sess := s.sessionFromRequest(r)
-	if sess == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
+	if !s.cloudReady(w, userID, stateStore, tokenStore) {
 		return
 	}
 	if !validateCSRF(sess, r.Header.Get("X-CSRF-Token")) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "CSRF validation failed."})
 		return
 	}
-	if !s.driveConnected() {
+	if !s.driveConnected(stateStore) {
 		writeJSON(w, http.StatusConflict, map[string]string{
 			"error": "Google Drive is not connected. Connect your Google account before backing up.",
 		})
 		return
 	}
 
-	repos, err := s.discoverRepositories(r)
+	repos, err := s.discoverRepositories(r.Context(), stateStore, tokenStore)
 	if err != nil {
 		s.writeDiscoveryError(w, err)
 		return
@@ -429,12 +506,12 @@ func (s *Server) handleBackupAll(w http.ResponseWriter, r *http.Request) {
 
 	var started []jobView
 	for _, repo := range repos {
-		internalRepo, err := s.findOrCreateInternalRepo(repo.ID, repo.FullName, repo.DefaultBranch)
+		internalRepo, err := s.findOrCreateInternalRepo(stateStore, repo.ID, repo.FullName, repo.DefaultBranch)
 		if err != nil {
 			s.logger.Warn("ensure internal repo record (backup all)", "repo", repo.FullName, "error", err)
 			continue
 		}
-		job, err := s.startProtectedBackup(internalRepo.ID)
+		job, err := s.startProtectedBackup(userID, stateStore, tokenStore, internalRepo.ID)
 		if err == errJobInFlight {
 			continue // already running; skip rather than fail the sweep
 		}
@@ -449,12 +526,17 @@ func (s *Server) handleBackupAll(w http.ResponseWriter, r *http.Request) {
 
 // handleProtectedBackupJob returns a single state-backed backup job by id.
 func (s *Server) handleProtectedBackupJob(w http.ResponseWriter, r *http.Request) {
+	_, stateStore, _, _, err := s.requireUser(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
+		return
+	}
 	if s.github == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub integration is not configured."})
 		return
 	}
 	id := r.PathValue("id")
-	job, ok := s.stateStore.BackupJob(id)
+	job, ok := stateStore.BackupJob(id)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "backup job not found"})
 		return
@@ -464,16 +546,21 @@ func (s *Server) handleProtectedBackupJob(w http.ResponseWriter, r *http.Request
 
 // handleProtectedBackupJobs lists the backup jobs for a protected repository.
 func (s *Server) handleProtectedBackupJobs(w http.ResponseWriter, r *http.Request) {
+	_, stateStore, _, _, err := s.requireUser(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
+		return
+	}
 	if s.github == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub integration is not configured."})
 		return
 	}
 	id := r.PathValue("id")
-	if _, ok := s.stateStore.ProtectedRepo(id); !ok {
+	if _, ok := stateStore.ProtectedRepo(id); !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "protected repository not found"})
 		return
 	}
-	jobs := s.stateStore.BackupJobs()
+	jobs := stateStore.BackupJobs()
 	var out []state.BackupJob
 	for _, j := range jobs {
 		if j.ProtectedRepoID == id {
@@ -486,16 +573,21 @@ func (s *Server) handleProtectedBackupJobs(w http.ResponseWriter, r *http.Reques
 // handleProtectedBackupHistory lists the immutable backup records for a
 // protected repository.
 func (s *Server) handleProtectedBackupHistory(w http.ResponseWriter, r *http.Request) {
+	_, stateStore, _, _, err := s.requireUser(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
+		return
+	}
 	if s.github == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub integration is not configured."})
 		return
 	}
 	id := r.PathValue("id")
-	if _, ok := s.stateStore.ProtectedRepo(id); !ok {
+	if _, ok := stateStore.ProtectedRepo(id); !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "protected repository not found"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"backups": backupsView(s.stateStore.BackupRecordsForRepo(id))})
+	writeJSON(w, http.StatusOK, map[string]any{"backups": backupsView(stateStore.BackupRecordsForRepo(id))})
 }
 
 // --- response shaping ---

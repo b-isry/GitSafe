@@ -18,7 +18,7 @@ import (
 func TestRunProtectedBackupSanitizesJobError(t *testing.T) {
 	st := &fakeStateStore{}
 	repo := seedDriveJob(t, st)
-	s := envCloudServer(t, st, true) // Drive connected: backup flow reaches the bundler
+	s, tk := envCloudServer(t, st, true) // Drive connected: backup flow reaches the bundler
 	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
 		return "drive-x", nil
 	}
@@ -26,7 +26,8 @@ func TestRunProtectedBackupSanitizesJobError(t *testing.T) {
 		return bundleOutcome{}, fmt.Errorf("mirror clone \"https://x-access-token:SUPERSECRET@github.com/%s.git\": boom", fullName)
 	}
 
-	s.runProtectedBackup("j1", repo)
+	userID := int64(42)
+	s.runProtectedBackup(userID, st, tk, "j1", repo)
 
 	job, ok := st.BackupJob("j1")
 	if !ok || job.State != state.JobFailed {
@@ -51,13 +52,13 @@ func TestRunProtectedBackupSanitizesJobError(t *testing.T) {
 func TestStartProtectedBackupRemovesOrphanJobOnSaveFailure(t *testing.T) {
 	st := &fakeStateStore{}
 	seedProtectedRepo(st, "p1", "acme/alpha", "main")
-	s := envCloudServer(t, st, true)
+	s, tk := envCloudServer(t, st, true)
 	st.errors = map[string]error{"save": errBoom}
 	s.bundleBackup = func(ctx context.Context, fullName, token, output string) (bundleOutcome, error) {
 		return bundleOutcome{}, nil
 	}
 
-	if _, err := s.startProtectedBackup("p1"); err == nil {
+	if _, err := s.startProtectedBackup(int64(42), st, tk, "p1"); err == nil {
 		t.Fatal("expected startProtectedBackup to fail on save error")
 	}
 	if len(st.BackupJobs()) != 0 {
@@ -70,7 +71,7 @@ func TestStartProtectedBackupRemovesOrphanJobOnSaveFailure(t *testing.T) {
 func TestProtectedBackupConcurrentTriggers(t *testing.T) {
 	st := &fakeStateStore{}
 	seedProtectedRepo(st, "p1", "acme/alpha", "main")
-	s := envCloudServer(t, st, true)
+	s, tk := envCloudServer(t, st, true)
 	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
 		return "drive-x", nil
 	}
@@ -93,7 +94,7 @@ func TestProtectedBackupConcurrentTriggers(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			_, err := s.startProtectedBackup("p1")
+			_, err := s.startProtectedBackup(int64(42), st, tk, "p1")
 			mu.Lock()
 			results[i] = err
 			mu.Unlock()
@@ -124,7 +125,7 @@ func TestProtectedBackupConcurrentTriggers(t *testing.T) {
 func TestProtectedBackupHistoryListWhileRunning(t *testing.T) {
 	st := &fakeStateStore{}
 	seedProtectedRepo(st, "p1", "acme/alpha", "main")
-	s := envCloudServer(t, st, true)
+	s, tk := envCloudServer(t, st, true)
 	s.driveUpload = func(ctx context.Context, bundlePath, folderID, refreshToken string, onProgress func(int64, int64), logger *slog.Logger) (string, error) {
 		return "drive-x", nil
 	}
@@ -132,21 +133,22 @@ func TestProtectedBackupHistoryListWhileRunning(t *testing.T) {
 		return bundleOutcome{BundlePath: "/out/x.bundle", BundleName: "x.bundle", SizeBytes: 1, SHA256: "a"}, nil
 	}
 
-	job, err := s.startProtectedBackup("p1")
+	job, err := s.startProtectedBackup(int64(42), st, tk, "p1")
 	if err != nil {
 		t.Fatal(err)
 	}
+	cookie, _ := authedCookie(t, s, 42)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req := request(t, s, http.MethodGet, "/api/protected-repositories/p1/backup-jobs", nil)
+			req := request(t, s, http.MethodGet, "/api/protected-repositories/p1/backup-jobs", cookie)
 			if req.Code != http.StatusOK {
 				t.Errorf("jobs list status = %d", req.Code)
 			}
-			req2 := request(t, s, http.MethodGet, "/api/backup-jobs/"+job.ID, nil)
+			req2 := request(t, s, http.MethodGet, "/api/backup-jobs/"+job.ID, cookie)
 			if req2.Code != http.StatusOK {
 				t.Errorf("job status = %d", req2.Code)
 			}
