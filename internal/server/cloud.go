@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -21,8 +22,9 @@ const cloudRepositoriesPage = "cloud-repositories"
 // regardless of whether the deployment has configured a GitHub application.
 func (s *Server) handleCloudRepositories(w http.ResponseWriter, r *http.Request) {
 	view := CloudView{Configured: s.github != nil}
-	if s.stateStore != nil {
-		if conn, ok := s.stateStore.GitHubConnection(); ok {
+	userID, stateStore, _, _ := s.requireUserOrZero(r)
+	if userID != 0 {
+		if conn, ok := stateStore.GitHubConnection(); ok {
 			view.Connected = true
 			view.Login = conn.Login
 			view.Name = conn.Name
@@ -73,10 +75,15 @@ type latestBackupView struct {
 // a 503 when GitHub is not configured, a 409 when not connected, and
 // provider-specific errors for upstream failures.
 func (s *Server) handleAPIRepositories(w http.ResponseWriter, r *http.Request) {
-	if !s.cloudReady(w) {
+	userID, stateStore, tokenStore, _, err := s.requireUser(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
 		return
 	}
-	repos, err := s.discoverRepositories(r)
+	if !s.cloudReady(w, userID, stateStore, tokenStore) {
+		return
+	}
+	repos, err := s.discoverRepositories(r.Context(), stateStore, tokenStore)
 	if err != nil {
 		s.writeDiscoveryError(w, err)
 		return
@@ -87,7 +94,7 @@ func (s *Server) handleAPIRepositories(w http.ResponseWriter, r *http.Request) {
 	// requires to correlate jobs and history) is used only to look up those
 	// records; the user never sees or creates it directly.
 	internal := map[int64]state.ProtectedRepo{}
-	for _, p := range s.stateStore.ProtectedRepos() {
+	for _, p := range stateStore.ProtectedRepos() {
 		internal[p.GitHubID] = p
 	}
 
@@ -98,7 +105,7 @@ func (s *Server) handleAPIRepositories(w http.ResponseWriter, r *http.Request) {
 		daysSinceLastPush, stale := pushStaleness(rp.PushedAt, now, threshold)
 		var lb *latestBackupView
 		if rec, ok := internal[rp.ID]; ok {
-			lb = latestBackupFor(s.stateStore.BackupRecordsForRepo(rec.ID))
+			lb = latestBackupFor(stateStore.BackupRecordsForRepo(rec.ID))
 		}
 		out = append(out, map[string]any{
 			"githubId":          rp.ID,
@@ -127,8 +134,8 @@ func (s *Server) handleAPIRepositories(w http.ResponseWriter, r *http.Request) {
 // demand. This is what lets the dashboard back up any repository directly: the
 // engine's record is materialized lazily at backup time instead of requiring a
 // user-facing "protect" step first.
-func (s *Server) findOrCreateInternalRepo(githubID int64, fullName, defaultBranch string) (state.ProtectedRepo, error) {
-	for _, r := range s.stateStore.ProtectedRepos() {
+func (s *Server) findOrCreateInternalRepo(stateStore StateStore, githubID int64, fullName, defaultBranch string) (state.ProtectedRepo, error) {
+	for _, r := range stateStore.ProtectedRepos() {
 		if r.GitHubID == githubID {
 			return r, nil
 		}
@@ -140,11 +147,11 @@ func (s *Server) findOrCreateInternalRepo(githubID int64, fullName, defaultBranc
 		DefaultBranch: defaultBranch,
 		AddedAt:       time.Now(),
 	}
-	if err := s.stateStore.AddProtectedRepo(rec); err != nil {
+	if err := stateStore.AddProtectedRepo(rec); err != nil {
 		// A concurrent request already created the record; reuse it so this
 		// repository is never duplicated internally.
 		if errors.Is(err, state.ErrDuplicate) {
-			for _, r := range s.stateStore.ProtectedRepos() {
+			for _, r := range stateStore.ProtectedRepos() {
 				if r.GitHubID == githubID {
 					return r, nil
 				}
@@ -152,7 +159,7 @@ func (s *Server) findOrCreateInternalRepo(githubID int64, fullName, defaultBranc
 		}
 		return state.ProtectedRepo{}, err
 	}
-	if err := s.saveState(); err != nil {
+	if err := stateStore.Save(); err != nil {
 		return state.ProtectedRepo{}, err
 	}
 	return rec, nil
@@ -172,16 +179,17 @@ func pushStaleness(pushedAt, now time.Time, threshold int) (daysSinceLastPush *i
 
 // discoverRepositories resolves the connection token and returns the live
 // discovered repository set for the authenticated account.
-func (s *Server) discoverRepositories(r *http.Request) ([]providers.Repository, error) {
-	conn, ok := s.stateStore.GitHubConnection()
+// It uses the provided per-user state and token stores.
+func (s *Server) discoverRepositories(ctx context.Context, stateStore StateStore, tokenStore TokenStore) ([]providers.Repository, error) {
+	conn, ok := stateStore.GitHubConnection()
 	if !ok {
 		return nil, errGitHubDisconnected
 	}
-	token, err := s.tokenStore.Get(conn.TokenRef)
+	token, err := tokenStore.Get(conn.TokenRef)
 	if err != nil {
 		return nil, errTokenMissing
 	}
-	return s.githubLister(r.Context(), token)
+	return s.githubLister(ctx, token)
 }
 
 // s (small) sentinel errors keep discovery failures distinguishable in handlers.
@@ -223,12 +231,12 @@ const maxProtectBatch = 500
 // are never persisted), is idempotent for already-protected repositories, and
 // requires a valid CSRF token.
 func (s *Server) handleProtectRepositories(w http.ResponseWriter, r *http.Request) {
-	if !s.cloudReady(w) {
+	userID, stateStore, tokenStore, sess, err := s.requireUser(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
 		return
 	}
-	sess := s.sessionFromRequest(r)
-	if sess == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
+	if !s.cloudReady(w, userID, stateStore, tokenStore) {
 		return
 	}
 	if !validateCSRF(sess, r.Header.Get("X-CSRF-Token")) {
@@ -250,14 +258,14 @@ func (s *Server) handleProtectRepositories(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	repos, err := s.discoverRepositories(r)
+	repos, err := s.discoverRepositories(r.Context(), stateStore, tokenStore)
 	if err != nil {
 		s.writeDiscoveryError(w, err)
 		return
 	}
 
 	protected := map[int64]bool{}
-	for _, p := range s.stateStore.ProtectedRepos() {
+	for _, p := range stateStore.ProtectedRepos() {
 		protected[p.GitHubID] = true
 	}
 
@@ -267,14 +275,15 @@ func (s *Server) handleProtectRepositories(w http.ResponseWriter, r *http.Reques
 	for _, rec := range toAdd {
 		rec.ID = uuid.NewString()
 		rec.AddedAt = time.Now()
-		if err := s.stateStore.AddProtectedRepo(rec); err != nil {
+		if err := stateStore.AddProtectedRepo(rec); err != nil {
 			// A concurrent duplicate falls back to "already protected".
 			already = append(already, rec.GitHubID)
 			continue
 		}
 		added = append(added, toProtectedView(rec))
 	}
-	if err := s.saveState(); err != nil {
+	if err := s.saveState(stateStore); err != nil {
+		s.logger.Error("persist protected repositories", "cause", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not persist the protected repositories"})
 		return
 	}
@@ -336,16 +345,21 @@ func toProtectedView(r state.ProtectedRepo) protectedRepoView {
 
 // handleListProtectedRepositories returns the currently protected repositories
 // from state (the source of truth), without contacting GitHub.
-func (s *Server) handleListProtectedRepositories(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleListProtectedRepositories(w http.ResponseWriter, r *http.Request) {
+	_, stateStore, _, _, err := s.requireUser(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
+		return
+	}
 	if s.github == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub integration is not configured."})
 		return
 	}
-	repos := s.stateStore.ProtectedRepos()
+	repos := stateStore.ProtectedRepos()
 	out := make([]protectedRepoView, 0, len(repos))
 	for _, rp := range repos {
 		view := toProtectedView(rp)
-		view.LatestBackup = latestBackupFor(s.stateStore.BackupRecordsForRepo(rp.ID))
+		view.LatestBackup = latestBackupFor(stateStore.BackupRecordsForRepo(rp.ID))
 		out = append(out, view)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"repositories": out})
@@ -382,13 +396,13 @@ func latestBackupFor(records []state.BackupRecord) *latestBackupView {
 // handleRemoveProtectedRepository removes protection for a single repository by
 // its local ProtectedRepo id. It requires a valid CSRF token.
 func (s *Server) handleRemoveProtectedRepository(w http.ResponseWriter, r *http.Request) {
-	if s.github == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub integration is not configured."})
+	_, stateStore, _, sess, err := s.requireUser(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
 		return
 	}
-	sess := s.sessionFromRequest(r)
-	if sess == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "No active session. Refresh the page and try again."})
+	if s.github == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub integration is not configured."})
 		return
 	}
 	if !validateCSRF(sess, r.Header.Get("X-CSRF-Token")) {
@@ -397,11 +411,12 @@ func (s *Server) handleRemoveProtectedRepository(w http.ResponseWriter, r *http.
 	}
 
 	id := strings.TrimSpace(r.PathValue("id"))
-	if err := s.stateStore.RemoveProtectedRepo(id); err != nil {
+	if err := stateStore.RemoveProtectedRepo(id); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "protected repository not found"})
 		return
 	}
-	if err := s.saveState(); err != nil {
+	if err := s.saveState(stateStore); err != nil {
+		s.logger.Error("persist protected repository removal", "cause", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not persist the change"})
 		return
 	}
@@ -411,12 +426,12 @@ func (s *Server) handleRemoveProtectedRepository(w http.ResponseWriter, r *http.
 // cloudReady reports whether the GitHub integration and its state/token stores
 // are wired up, writing a 503 when not. It is used by handlers that need the
 // cloud connection.
-func (s *Server) cloudReady(w http.ResponseWriter) bool {
+func (s *Server) cloudReady(w http.ResponseWriter, userID int64, stateStore StateStore, tokenStore TokenStore) bool {
 	if s.github == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub integration is not configured."})
 		return false
 	}
-	if s.stateStore == nil || s.tokenStore == nil {
+	if userID == 0 || stateStore == nil || tokenStore == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub integration is not configured."})
 		return false
 	}

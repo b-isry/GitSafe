@@ -81,7 +81,8 @@ func postProtectRequest(t *testing.T, s *Server, cookie *http.Cookie, csrf strin
 
 func TestProtectRepositoriesNotConfigured(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), nil)
-	rec := postProtectRequest(t, s, nil, "", []int64{1})
+	cookie, _ := authedCookie(t, s, 42)
+	rec := postProtectRequest(t, s, cookie, "", []int64{1})
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
@@ -97,7 +98,7 @@ func TestProtectRepositoriesNoSession(t *testing.T) {
 
 func TestProtectRepositoriesMissingCSRF(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := postProtectRequest(t, s, cookie, "", []int64{1})
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
@@ -109,7 +110,7 @@ func TestProtectRepositoriesMissingCSRF(t *testing.T) {
 
 func TestProtectRepositoriesMalformedBody(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	req := httptest.NewRequest(http.MethodPost, "/api/protected-repositories", bytes.NewReader([]byte(`{not json`)))
 	req.RemoteAddr = "127.0.0.1:55555"
 	req.AddCookie(cookie)
@@ -123,25 +124,41 @@ func TestProtectRepositoriesMalformedBody(t *testing.T) {
 
 func TestProtectRepositoriesEmpty(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := postProtectRequest(t, s, cookie, csrf, nil)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }
 
-// csrfCookie establishes a session and returns the cookie + CSRF token.
-func csrfCookie(t *testing.T, s *Server) (*http.Cookie, string) {
+// authedCookie establishes a session for the given GitHub user ID and returns
+// the cookie and CSRF token. It imitates the OAuth callback having set userID on
+// the session; per-user stores resolved by request handlers come from
+// newCloudServer's fakes registered at user 42 (never a live OS keychain).
+func authedCookie(t *testing.T, s *Server, userID int64) (*http.Cookie, string) {
 	t.Helper()
 	rec := request(t, s, http.MethodGet, "/api/csrf", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("csrf status = %d", rec.Code)
+	}
 	var body map[string]string
-	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
 	var cookie *http.Cookie
 	for _, c := range rec.Result().Cookies() {
 		if c.Name == sessionCookieName {
 			cookie = c
 		}
 	}
+	if cookie == nil {
+		t.Fatal("no session cookie from /api/csrf")
+	}
+	sess, ok := s.sessions.get(cookie.Value)
+	if !ok {
+		t.Fatal("session not found after /api/csrf")
+	}
+	sess.userID = userID
 	return cookie, body["csrfToken"]
 }
 
@@ -151,7 +168,8 @@ func TestListProtectedRepositories(t *testing.T) {
 		{ID: "p1", GitHubID: 1, FullName: "a/b", DefaultBranch: "main"},
 	}
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	rec := request(t, s, http.MethodGet, "/api/protected-repositories", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/protected-repositories", cookie)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -219,7 +237,8 @@ func TestListProtectedRepositoriesIncludesLatestBackup(t *testing.T) {
 		{ID: "r1", ProtectedRepoID: "p1", FullName: "a/b", CreatedAt: time.Now(), BundleSize: 2048, Status: "uploaded", DriveFileID: "DRIVE-1"},
 	}
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	rec := request(t, s, http.MethodGet, "/api/protected-repositories", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/protected-repositories", cookie)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -246,7 +265,8 @@ func TestListProtectedRepositoriesIncludesLatestBackup(t *testing.T) {
 
 func TestListProtectedRepositoriesNotConfigured(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), nil)
-	rec := request(t, s, http.MethodGet, "/api/protected-repositories", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/protected-repositories", cookie)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
@@ -271,7 +291,7 @@ func TestRemoveProtectedRepositorySuccess(t *testing.T) {
 	st := &fakeStateStore{}
 	st.protected = []state.ProtectedRepo{{ID: "p1", GitHubID: 1, FullName: "a/b"}}
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := deleteProtected(t, s, cookie, csrf, "p1")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -288,7 +308,7 @@ func TestRemoveProtectedRepositoryUnknown(t *testing.T) {
 	st := &fakeStateStore{}
 	st.protected = []state.ProtectedRepo{{ID: "p1", GitHubID: 1}}
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := deleteProtected(t, s, cookie, csrf, "nope")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
@@ -299,7 +319,7 @@ func TestRemoveProtectedRepositoryNoCSRF(t *testing.T) {
 	st := &fakeStateStore{}
 	st.protected = []state.ProtectedRepo{{ID: "p1", GitHubID: 1}}
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
-	cookie, _ := csrfCookie(t, s)
+	cookie, _ := authedCookie(t, s, 42)
 	rec := deleteProtected(t, s, cookie, "", "p1")
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
@@ -311,7 +331,7 @@ func TestRemoveProtectedRepositoryNoCSRF(t *testing.T) {
 
 func TestRemoveProtectedRepositoryNotConfigured(t *testing.T) {
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), nil)
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := deleteProtected(t, s, cookie, csrf, "p1")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
@@ -363,7 +383,8 @@ func TestAPIRepositoriesIncludesStaleness(t *testing.T) {
 		}, nil
 	}
 
-	rec := request(t, s, http.MethodGet, "/api/repositories", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	rec := request(t, s, http.MethodGet, "/api/repositories", cookie)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}

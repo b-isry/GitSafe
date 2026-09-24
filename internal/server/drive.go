@@ -166,8 +166,8 @@ func (s *Server) handleDriveCallback(w http.ResponseWriter, r *http.Request) {
 		s.writeDriveUnavailable(w, "Google Drive sign-in is not available right now.", "This can be enabled by your GitSafe administrator. Please try again later.")
 		return
 	}
-	sess := s.sessionFromRequest(r)
-	if sess == nil {
+	_, stateStore, tokenStore, sess, err := s.requireUser(r)
+	if err != nil {
 		s.driveError(w, "session expired; start over")
 		return
 	}
@@ -202,18 +202,20 @@ func (s *Server) handleDriveCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.tokenStore.Set(tokenstore.DriveToken, result.RefreshToken); err != nil {
+	if err := tokenStore.Set(tokenstore.DriveToken, result.RefreshToken); err != nil {
+		s.logger.Error("drive oauth: store refresh token", "cause", err)
 		s.driveError(w, "could not store the access token securely")
 		return
 	}
 
-	s.stateStore.SetDriveConnection(state.DriveConnection{
+	stateStore.SetDriveConnection(state.DriveConnection{
 		AccountEmail:    result.AccountEmail,
 		ConnectedAt:     time.Now(),
 		StorageFolderID: result.StorageFolderID,
 		TokenRef:        tokenstore.DriveToken,
 	})
-	if err := s.saveState(); err != nil {
+	if err := s.saveState(stateStore); err != nil {
+		s.logger.Error("drive oauth: persist connection state", "cause", err)
 		s.driveError(w, "could not persist the connection state")
 		return
 	}
@@ -226,8 +228,8 @@ func (s *Server) handleDriveCallback(w http.ResponseWriter, r *http.Request) {
 // token revocation via Google's API is a best-effort cleanup and a revocation
 // failure never blocks the disconnect.
 func (s *Server) handleDisconnectDrive(w http.ResponseWriter, r *http.Request) {
-	sess := s.sessionFromRequest(r)
-	if sess == nil {
+	_, stateStore, tokenStore, sess, err := s.requireUser(r)
+	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{
 			"error": "No active session. Refresh the page and try again.",
 		})
@@ -241,19 +243,20 @@ func (s *Server) handleDisconnectDrive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var refreshToken string
-	if conn, ok := s.stateStore.DriveConnection(); ok {
-		if t, err := s.tokenStore.Get(conn.TokenRef); err == nil {
+	if conn, ok := stateStore.DriveConnection(); ok {
+		if t, err := tokenStore.Get(conn.TokenRef); err == nil {
 			refreshToken = t
 		}
-		if err := s.tokenStore.Delete(conn.TokenRef); err != nil {
+		if err := tokenStore.Delete(conn.TokenRef); err != nil {
+			s.logger.Error("drive oauth: delete refresh token", "cause", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{
 				"error": "could not remove the access token",
 			})
 			return
 		}
-		s.stateStore.ClearDriveConnection()
+		stateStore.ClearDriveConnection()
 	}
-	if err := s.saveState(); err != nil {
+	if err := s.saveState(stateStore); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "could not persist the disconnect",
 		})
@@ -279,31 +282,31 @@ func (s *Server) driveConfigured() bool {
 }
 
 // driveConnection returns the persisted Drive connection, if any.
-func (s *Server) driveConnection() (state.DriveConnection, bool) {
-	if s.stateStore == nil {
+func (s *Server) driveConnection(stateStore StateStore) (state.DriveConnection, bool) {
+	if stateStore == nil {
 		return state.DriveConnection{}, false
 	}
-	return s.stateStore.DriveConnection()
+	return stateStore.DriveConnection()
 }
 
 // driveConnected reports whether a Drive account is actually connected AND the
 // deployment is configured to support it.
-func (s *Server) driveConnected() bool {
+func (s *Server) driveConnected(stateStore StateStore) bool {
 	if !s.driveConfigured() {
 		return false
 	}
-	_, ok := s.driveConnection()
+	_, ok := s.driveConnection(stateStore)
 	return ok
 }
 
 // driveRefreshToken returns the stored refresh token for the connected Drive
 // account, or an error (with a user-facing message) when Drive is not usable.
-func (s *Server) driveRefreshToken() (string, error) {
-	conn, ok := s.driveConnection()
+func (s *Server) driveRefreshToken(stateStore StateStore, tokenStore TokenStore) (string, error) {
+	conn, ok := s.driveConnection(stateStore)
 	if !ok {
 		return "", errDriveNotConnected
 	}
-	token, err := s.tokenStore.Get(conn.TokenRef)
+	token, err := tokenStore.Get(conn.TokenRef)
 	if err != nil {
 		return "", fmt.Errorf("Google Drive access token is unavailable: %w", err)
 	}

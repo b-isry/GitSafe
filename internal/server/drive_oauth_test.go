@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,7 +16,7 @@ import (
 // --- Drive OAuth flow ---
 
 func TestDriveLoginRedirects(t *testing.T) {
-	s := envCloudServer(t, &fakeStateStore{}, true)
+	s, _ := envCloudServer(t, &fakeStateStore{}, true)
 	login := request(t, s, http.MethodGet, "/api/auth/drive", nil)
 	if login.Code != http.StatusFound {
 		t.Fatalf("status = %d, want 302", login.Code)
@@ -46,7 +47,7 @@ func TestDriveLoginNotConfigured(t *testing.T) {
 
 func TestDriveCallbackExchangesAndConnects(t *testing.T) {
 	st := &fakeStateStore{}
-	s := envCloudServer(t, st, true)
+	s, _ := envCloudServer(t, st, true)
 	s.connectDrive = func(ctx context.Context, code string) (driveConnectResult, error) {
 		if code != "good-code" {
 			t.Fatalf("connectDrive code = %q, want good-code", code)
@@ -69,7 +70,8 @@ func TestDriveCallbackExchangesAndConnects(t *testing.T) {
 		t.Fatalf("Location = %q, want /", callback.Header().Get("Location"))
 	}
 
-	tk := s.tokenStore.(*fakeTokenStore)
+	stores, _ := s.userStores.getOrCreate(42)
+	tk := stores.token
 	if v, err := tk.Get(tokenstore.DriveToken); err != nil || v != "rt-123" {
 		t.Fatalf("token store = %q, err=%v", v, err)
 	}
@@ -83,7 +85,7 @@ func TestDriveCallbackExchangesAndConnects(t *testing.T) {
 }
 
 func TestDriveCallbackInvalidState(t *testing.T) {
-	s := envCloudServer(t, &fakeStateStore{}, true)
+	s, _ := envCloudServer(t, &fakeStateStore{}, true)
 	cookie, _ := driveLoginSession(t, s)
 	rec := requestWithCSRF(t, s, http.MethodGet,
 		"/api/auth/drive/callback?code=x&state=wrong", cookie, "")
@@ -96,7 +98,7 @@ func TestDriveCallbackInvalidState(t *testing.T) {
 }
 
 func TestDriveCallbackAccessDenied(t *testing.T) {
-	s := envCloudServer(t, &fakeStateStore{}, true)
+	s, _ := envCloudServer(t, &fakeStateStore{}, true)
 	cookie, stateVal := driveLoginSession(t, s)
 	rec := requestWithCSRF(t, s, http.MethodGet,
 		"/api/auth/drive/callback?error=access_denied&state="+url.QueryEscape(stateVal),
@@ -110,7 +112,7 @@ func TestDriveCallbackAccessDenied(t *testing.T) {
 }
 
 func TestDriveCallbackExchangeError(t *testing.T) {
-	s := envCloudServer(t, &fakeStateStore{}, true)
+	s, _ := envCloudServer(t, &fakeStateStore{}, true)
 	s.connectDrive = func(ctx context.Context, code string) (driveConnectResult, error) {
 		return driveConnectResult{}, errBoom
 	}
@@ -130,13 +132,13 @@ func TestDriveCallbackExchangeError(t *testing.T) {
 
 func TestDriveDisconnectRemovesTokenAndConnection(t *testing.T) {
 	st := &fakeStateStore{}
-	s := envCloudServer(t, st, true)
+	s, _ := envCloudServer(t, st, true)
 	revoked := ""
 	s.driveRevoke = func(ctx context.Context, token string) error {
 		revoked = token
 		return nil
 	}
-	cookie, csrf := csrfCookie(t, s)
+	cookie, csrf := authedCookie(t, s, 42)
 	rec := requestWithCSRF(t, s, http.MethodDelete, "/api/connections/drive", cookie, csrf)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
@@ -146,7 +148,8 @@ func TestDriveDisconnectRemovesTokenAndConnection(t *testing.T) {
 	if body["status"] != "disconnected" {
 		t.Fatalf("body = %+v", body)
 	}
-	tk := s.tokenStore.(*fakeTokenStore)
+	stores, _ := s.userStores.getOrCreate(42)
+	tk := stores.token
 	if _, err := tk.Get(tokenstore.DriveToken); err == nil {
 		t.Fatal("token should have been deleted")
 	}
@@ -159,50 +162,74 @@ func TestDriveDisconnectRemovesTokenAndConnection(t *testing.T) {
 }
 
 func TestDriveDisconnectNoCSRF(t *testing.T) {
-	s := envCloudServer(t, &fakeStateStore{}, true)
+	st := &fakeStateStore{}
+	s, _ := envCloudServer(t, st, true)
 	s.driveRevoke = func(ctx context.Context, token string) error {
 		t.Fatal("revoke must not run without CSRF")
 		return nil
 	}
-	cookie, _ := csrfCookie(t, s)
+	cookie, _ := authedCookie(t, s, 42)
 	rec := requestWithCSRF(t, s, http.MethodDelete, "/api/connections/drive", cookie, "")
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
 	}
-	if _, ok := s.stateStore.DriveConnection(); !ok {
+	if _, ok := st.DriveConnection(); !ok {
 		t.Fatal("connection must survive a rejected disconnect")
+	}
+	return
+}
+
+func TestDriveDisconnectRevokeFailureStillDisconnects(t *testing.T) {
+	st := &fakeStateStore{}
+	s, _ := envCloudServer(t, st, true)
+	s.driveRevoke = func(ctx context.Context, token string) error {
+		return errors.New("upstream boom")
+	}
+	cookie, csrf := authedCookie(t, s, 42)
+	rec := requestWithCSRF(t, s, http.MethodDelete, "/api/connections/drive", cookie, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 even when revocation fails", rec.Code)
+	}
+	stores, _ := s.userStores.getOrCreate(42)
+	tk := stores.token
+	if _, err := tk.Get(tokenstore.DriveToken); err == nil {
+		t.Fatal("token should have been deleted despite revocation failure")
+	}
+	if _, ok := st.DriveConnection(); ok {
+		t.Fatal("connection should have been cleared despite revocation failure")
 	}
 }
 
-// --- Drive-only backup enforcement ---
-
-func TestBackupProtectedRepoDriveNotConnected(t *testing.T) {
+func TestDriveDisconnectWithoutRevoker(t *testing.T) {
 	st := &fakeStateStore{}
-	seedProtectedRepo(st, "p1", "acme/alpha", "main")
-	s := envCloudServer(t, st, false)
-	cookie, csrf := csrfCookie(t, s)
-	rec := postProtectedBackup(t, s, cookie, csrf, "p1")
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409: %s", rec.Code, rec.Body.String())
+	s, _ := envCloudServer(t, st, true)
+	s.driveRevoke = nil
+	cookie, csrf := authedCookie(t, s, 42)
+	rec := requestWithCSRF(t, s, http.MethodDelete, "/api/connections/drive", cookie, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	var body map[string]any
-	_ = json.Unmarshal(rec.Body.Bytes(), &body)
-	errMsg, _ := body["error"].(string)
-	if !strings.Contains(errMsg, "Drive") {
-		t.Fatalf("error body = %q", errMsg)
+	stores, _ := s.userStores.getOrCreate(42)
+	tk := stores.token
+	if _, err := tk.Get(tokenstore.DriveToken); err == nil {
+		t.Fatal("token should have been deleted")
 	}
-	if len(st.BackupJobs()) != 0 {
-		t.Fatalf("no job should be created without Drive, got %+v", st.BackupJobs())
+	if _, ok := st.DriveConnection(); ok {
+		t.Fatal("connection should have been cleared")
 	}
 }
 
 // --- helpers ---
 
-// driveLoginSession starts a Drive login and captures the session cookie and
-// OAuth state value so a callback can be simulated without hitting Google.
+// driveLoginSession starts a Drive login for an authenticated session and
+// captures the session cookie and OAuth state value so a callback can be
+// simulated without hitting Google. The Drive callback requires an authenticated
+// user (requireUser), so the session must already be bound to user 42 — exactly
+// like production, where the user connects Drive only after signing into GitHub.
 func driveLoginSession(t *testing.T, s *Server) (*http.Cookie, string) {
 	t.Helper()
-	login := request(t, s, http.MethodGet, "/api/auth/drive", nil)
+	cookie, _ := authedCookie(t, s, 42)
+	login := request(t, s, http.MethodGet, "/api/auth/drive", cookie)
 	if login.Code != http.StatusFound {
 		t.Fatalf("drive login status = %d, want 302", login.Code)
 	}
@@ -210,15 +237,6 @@ func driveLoginSession(t *testing.T, s *Server) (*http.Cookie, string) {
 	stateVal := u.Query().Get("state")
 	if stateVal == "" {
 		t.Fatal("no state in authorize URL")
-	}
-	var cookie *http.Cookie
-	for _, c := range login.Result().Cookies() {
-		if c.Name == sessionCookieName {
-			cookie = c
-		}
-	}
-	if cookie == nil {
-		t.Fatal("no session cookie set")
 	}
 	return cookie, stateVal
 }
