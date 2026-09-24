@@ -113,13 +113,27 @@ type renderData struct {
 	Cloud CloudView
 }
 
+// TokenStoreFactory returns the per-user token store backend. It is called on
+// each user's first access so the server can keep one FileStore instance or
+// build fresh keyring handles without tests touching the real OS keychain.
+type TokenStoreFactory func() (TokenStore, error)
+
+// Options configures Server construction. Zero value selects the
+// environment-derived token backend (see tokenStoreFactoryFromEnv).
+type Options struct {
+	// TokenStore overrides the token backend selection. Tests inject fakes here
+	// so the construction self-test never touches a live OS keychain.
+	TokenStore TokenStoreFactory
+}
+
 // UserStoreManager manages per-user state and token stores.
 // Each user gets their own isolated state file and token namespace.
 type UserStoreManager struct {
-	mu       sync.RWMutex
-	stores   map[int64]*userStores
-	basePath string
-	logger   *slog.Logger
+	mu           sync.RWMutex
+	stores       map[int64]*userStores
+	basePath     string
+	logger       *slog.Logger
+	tokenFactory TokenStoreFactory
 }
 
 type userStores struct {
@@ -162,7 +176,16 @@ func (m *UserStoreManager) getOrCreate(userID int64) (*userStores, error) {
 		return nil, fmt.Errorf("open user state store: %w", err)
 	}
 
-	tokenStore := tokenstore.New()
+	factory := m.tokenFactory
+	if factory == nil {
+		// Defensive fallback for direct manager construction; production and
+		// tests go through New/NewWithOptions which always set a factory.
+		factory = func() (TokenStore, error) { return tokenstore.New(), nil }
+	}
+	tokenStore, err := factory()
+	if err != nil {
+		return nil, fmt.Errorf("create user token store: %w", err)
+	}
 
 	stores := &userStores{
 		state: st,
@@ -207,6 +230,15 @@ var pages = []string{cloudRepositoriesPage}
 const ConfigPathFile = "config.yaml"
 
 func New(logger *slog.Logger, app *App, configPath string) (*Server, error) {
+	return NewWithOptions(logger, app, configPath, Options{})
+}
+
+// NewWithOptions builds a Server, selecting the per-user token backend and
+// verifying it with a Set/Get/Delete self-test before boot. A backend that
+// cannot round-trip a token (for example a headless container whose OS keyring
+// has no Secret Service) refuses startup with an error instead of failing at
+// the first login.
+func NewWithOptions(logger *slog.Logger, app *App, configPath string, opts Options) (*Server, error) {
 	tmpls := make(map[string]*template.Template, len(pages))
 	for _, p := range pages {
 		t, err := template.New("gitsafe").ParseFS(
@@ -225,6 +257,19 @@ func New(logger *slog.Logger, app *App, configPath string) (*Server, error) {
 	if basePath == "." {
 		basePath = ".gitsafe"
 	}
+
+	factory := opts.TokenStore
+	if factory == nil {
+		var err error
+		factory, err = tokenStoreFactoryFromEnv(basePath)
+		if err != nil {
+			return nil, fmt.Errorf("configure token store: %w", err)
+		}
+	}
+	if err := probeTokenStore(factory); err != nil {
+		return nil, fmt.Errorf("token store self-test: %w", err)
+	}
+
 	srv := &Server{
 		tmpls:        tmpls,
 		logger:       logger,
@@ -238,10 +283,36 @@ func New(logger *slog.Logger, app *App, configPath string) (*Server, error) {
 		userBackups:  make(map[int64]int),
 		repoSize:     nil, // nil means use default implementation
 	}
+	srv.userStores.tokenFactory = factory
 	srv.githubLister = func(ctx context.Context, token string) ([]providers.Repository, error) {
 		return srv.githubClientFor(token).ListRepositories(ctx)
 	}
 	return srv, nil
+}
+
+// probeTokenStore exercises the selected backend with a throwaway reference.
+// Any failure (construction, Set, Get, Delete, or a wrong read-back) refuses
+// the boot.
+func probeTokenStore(factory TokenStoreFactory) error {
+	st, err := factory()
+	if err != nil {
+		return fmt.Errorf("create backend: %w", err)
+	}
+	ref := "__gitsafe_probe_" + randToken(8)
+	if err := st.Set(ref, "probe"); err != nil {
+		return fmt.Errorf("set: %w", err)
+	}
+	got, err := st.Get(ref)
+	if err != nil {
+		return fmt.Errorf("get: %w", err)
+	}
+	if got != "probe" {
+		return fmt.Errorf("read-back mismatch: got %q", got)
+	}
+	if err := st.Delete(ref); err != nil {
+		return fmt.Errorf("delete: %w", err)
+	}
+	return nil
 }
 
 func (s *Server) Routes() http.Handler {

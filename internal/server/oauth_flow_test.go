@@ -76,10 +76,10 @@ func TestCloudRepositoriesPageAlwaysOffersConnect(t *testing.T) {
 func TestCloudRepositoriesPageConnected(t *testing.T) {
 	st := &fakeStateStore{}
 	st.SetGitHubConnection(state.GitHubConnection{
-		GitHubID: 42, Login: "octocat", Name: "Oc ToCat", TokenRef: tokenstore.GitHubToken,
+		GitHubID: 42, Login: "octocat", Name: "Oc ToCat", TokenRef: tokenstore.GitHubTokenFor(42),
 	})
 	tk := newFakeTokenStore()
-	tk.data[tokenstore.GitHubToken] = "tok"
+	tk.data[tokenstore.GitHubTokenFor(42)] = "tok"
 	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
 	cookie, _ := authedCookie(t, s, 42)
 
@@ -275,9 +275,9 @@ func TestGitHubCallbackRedirectsInternally(t *testing.T) {
 // API the browser can reach.
 func TestSecretNeverInAPIResponses(t *testing.T) {
 	st := &fakeStateStore{}
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
+	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubTokenFor(42)})
 	tk := newFakeTokenStore()
-	tk.data[tokenstore.GitHubToken] = "tok"
+	tk.data[tokenstore.GitHubTokenFor(42)] = "tok"
 	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "gh-client", ClientSecret: "supersecret"})
 	s.githubLister = func(ctx context.Context, token string) ([]providers.Repository, error) {
 		return []providers.Repository{{ID: 1, FullName: "a/b"}}, nil
@@ -313,9 +313,9 @@ func disconnectWithCSRF(t *testing.T, s *Server) *httptest.ResponseRecorder {
 // (never as a secret in a response).
 func TestGitHubDisconnectRevokesToken(t *testing.T) {
 	st := &fakeStateStore{}
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
+	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubTokenFor(42)})
 	tk := newFakeTokenStore()
-	tk.data[tokenstore.GitHubToken] = "tok"
+	tk.data[tokenstore.GitHubTokenFor(42)] = "tok"
 	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "gh-client", ClientSecret: "gh-secret"})
 
 	var revoked string
@@ -334,7 +334,7 @@ func TestGitHubDisconnectRevokesToken(t *testing.T) {
 	if st.hasGh {
 		t.Fatal("expected connection cleared")
 	}
-	if _, ok := tk.data[tokenstore.GitHubToken]; ok {
+	if _, ok := tk.data[tokenstore.GitHubTokenFor(42)]; ok {
 		t.Fatal("expected local token removed")
 	}
 	assertNoDevLeak(t, "disconnect response", rec.Body.String())
@@ -344,9 +344,9 @@ func TestGitHubDisconnectRevokesToken(t *testing.T) {
 // failure never blocks removing the local credential (the security boundary).
 func TestGitHubDisconnectRevokeFailureStillDisconnects(t *testing.T) {
 	st := &fakeStateStore{}
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
+	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubTokenFor(42)})
 	tk := newFakeTokenStore()
-	tk.data[tokenstore.GitHubToken] = "tok"
+	tk.data[tokenstore.GitHubTokenFor(42)] = "tok"
 	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id", ClientSecret: "sec"})
 	s.revokeToken = func(ctx context.Context, token string) error {
 		return errors.New("upstream boom")
@@ -359,7 +359,7 @@ func TestGitHubDisconnectRevokeFailureStillDisconnects(t *testing.T) {
 	if st.hasGh {
 		t.Fatal("expected connection cleared despite revocation failure")
 	}
-	if _, ok := tk.data[tokenstore.GitHubToken]; ok {
+	if _, ok := tk.data[tokenstore.GitHubTokenFor(42)]; ok {
 		t.Fatal("expected local token removed despite revocation failure")
 	}
 }
@@ -369,9 +369,9 @@ func TestGitHubDisconnectRevokeFailureStillDisconnects(t *testing.T) {
 // deployment credentials to revoke with).
 func TestGitHubDisconnectWithoutRevoker(t *testing.T) {
 	st := &fakeStateStore{}
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
+	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubTokenFor(42)})
 	tk := newFakeTokenStore()
-	tk.data[tokenstore.GitHubToken] = "tok"
+	tk.data[tokenstore.GitHubTokenFor(42)] = "tok"
 	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"}) // no secret → no revoker
 	if s.revokeToken != nil {
 		t.Fatal("revokeToken should not be wired without a client secret")
@@ -384,7 +384,7 @@ func TestGitHubDisconnectWithoutRevoker(t *testing.T) {
 	if st.hasGh {
 		t.Fatal("expected connection cleared")
 	}
-	if _, ok := tk.data[tokenstore.GitHubToken]; ok {
+	if _, ok := tk.data[tokenstore.GitHubTokenFor(42)]; ok {
 		t.Fatal("expected local token removed")
 	}
 }

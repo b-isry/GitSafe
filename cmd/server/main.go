@@ -63,6 +63,19 @@ func main() {
 		OutputPath: cfg.OutputPath,
 	}
 
+	// Determine the deployment mode before constructing the server: any
+	// non-loopback base URL is treated as production, where the encrypted file
+	// token store is required. Refuse to boot without the key so the failure
+	// happens at startup with an actionable message, not at the first login.
+	baseURL := cfg.BaseURLOrDefault()
+	logger.Info("base URL configured", "baseURL", baseURL)
+	if !server.IsLoopbackHost(baseURL) && os.Getenv(server.TokenKeyEnv) == "" {
+		logger.Error("refusing to boot production deployment: token encryption key is missing",
+			"baseURL", baseURL, "env", server.TokenKeyEnv,
+			"hint", "set a long random value for GITSAFE_TOKEN_KEY (e.g. openssl rand -hex 32)")
+		os.Exit(1)
+	}
+
 	srv, err := server.New(logger, app, "config.yaml")
 	if err != nil {
 		logger.Error("failed to create server", "error", err)
@@ -70,8 +83,6 @@ func main() {
 	}
 
 	// Phase 1: optional GitHub OAuth.
-	baseURL := cfg.BaseURLOrDefault()
-	logger.Info("base URL configured", "baseURL", baseURL)
 	var oauth *server.GitHubOAuth
 	if gh, ok := server.GitHubOAuthFromEnv(cfg.GitHub.ClientID, baseURL); ok {
 		oauth = gh
