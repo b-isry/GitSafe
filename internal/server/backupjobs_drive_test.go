@@ -19,8 +19,8 @@ import (
 func envCloudServer(t *testing.T, st *fakeStateStore, enabled bool) (*Server, *fakeTokenStore) {
 	t.Helper()
 	tk := newFakeTokenStore()
-	tk.data[tokenstore.GitHubToken] = "tok"
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
+	tk.data[tokenstore.GitHubTokenFor(42)] = "tok"
+	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubTokenFor(42)})
 
 	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
 	// Stub repo size check to return a small size (10 MB) for testing
@@ -33,12 +33,12 @@ func envCloudServer(t *testing.T, st *fakeStateStore, enabled bool) (*Server, *f
 			ClientSecret: "drive-secret",
 			RedirectURL:  "http://127.0.0.1:8080/api/auth/drive/callback",
 		})
-		tk.data[tokenstore.DriveToken] = "drv-refresh"
+		tk.data[tokenstore.DriveTokenFor(42)] = "drv-refresh"
 		st.SetDriveConnection(state.DriveConnection{
 			AccountEmail:    "octo@example.com",
 			ConnectedAt:     time.Now(),
 			StorageFolderID: "folder-1",
-			TokenRef:        tokenstore.DriveToken,
+			TokenRef:        tokenstore.DriveTokenFor(42),
 		})
 	}
 	return s, tk

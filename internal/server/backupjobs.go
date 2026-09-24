@@ -243,7 +243,7 @@ func (s *Server) runProtectedBackup(userID int64, stateStore StateStore, tokenSt
 
 	// Check repo size before cloning (use a short timeout for the API call)
 	sizeCtx, sizeCancel := context.WithTimeout(ctx, 30*time.Second)
-	repoSizeMB, err := s.checkRepoSize(sizeCtx, tokenStore, repo.FullName)
+	repoSizeMB, err := s.checkRepoSize(sizeCtx, tokenStore, conn.TokenRef, repo.FullName)
 	sizeCancel()
 	if err != nil {
 		bg.Error("failed to check repo size", "job", jobID, "repo", repo.FullName, "error", err)
@@ -341,12 +341,13 @@ func (s *Server) finishProtectedJob(stateStore StateStore, jobID string, repo st
 
 // checkRepoSize queries the GitHub API for the repository size in MB.
 // Returns the size in MB, or an error if the repository cannot be found.
-func (s *Server) checkRepoSize(ctx context.Context, tokenStore TokenStore, fullName string) (int, error) {
+func (s *Server) checkRepoSize(ctx context.Context, tokenStore TokenStore, tokenRef, fullName string) (int, error) {
 	if s.repoSize != nil {
 		return s.repoSize(ctx, fullName)
 	}
-	// Get the GitHub token from the per-user token store
-	token, err := tokenStore.Get(tokenRefGitHub)
+	// Get the GitHub token from the per-user token store using the reference
+	// recorded on the connection (a per-user ref such as "github.42").
+	token, err := tokenStore.Get(tokenRef)
 	if err != nil {
 		return 0, err
 	}

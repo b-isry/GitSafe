@@ -84,9 +84,9 @@ func TestLatestBackupForOnlySuccessful(t *testing.T) {
 // status from actual successful backups, not from protection/config state.
 func TestAPIRepositoriesBackupStatus(t *testing.T) {
 	st := &fakeStateStore{}
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
+	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubTokenFor(42)})
 	tk := newFakeTokenStore()
-	tk.data[tokenstore.GitHubToken] = "tok"
+	tk.data[tokenstore.GitHubTokenFor(42)] = "tok"
 	// Repo 11: previously "protected" record exists, but it NEVER backed up.
 	// Repo 22: has a successful backup. Repo 33: has only failed attempts.
 	// Repo 44: no internal record at all.
