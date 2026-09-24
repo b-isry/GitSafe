@@ -12,6 +12,7 @@ import (
 	"github.com/b-isry/gitsafe/internal/githuboauth"
 	"github.com/b-isry/gitsafe/internal/providers"
 	"github.com/b-isry/gitsafe/internal/state"
+	"github.com/b-isry/gitsafe/internal/tokenstore"
 )
 
 // GitHubOAuth is the Phase 1 OAuth application configuration used by the server.
@@ -221,8 +222,9 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 	stateStore := stores.state
 	tokenStore := stores.token
 
-	// Store the token in the per-user token store
-	if err := tokenStore.Set(tokenRefGitHub, token); err != nil {
+	// Store the token under a per-user reference so accounts never share a
+	// storage key (on the OS keyring or in the encrypted file store).
+	if err := tokenStore.Set(tokenstore.GitHubTokenFor(userID), token); err != nil {
 		s.logger.Error("github oauth: store access token", "cause", err)
 		s.oauthError(w, "could not store the access token securely")
 		return
@@ -236,7 +238,7 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		AvatarURL:   identity.AvatarURL,
 		Scopes:      identity.Scopes,
 		ConnectedAt: time.Now(),
-		TokenRef:    tokenRefGitHub,
+		TokenRef:    tokenstore.GitHubTokenFor(userID),
 	})
 	if err := s.saveState(stores.state); err != nil {
 		s.logger.Error("github oauth: persist connection state", "cause", err)
@@ -387,9 +389,6 @@ func (s *Server) handleCSRF(w http.ResponseWriter, r *http.Request) {
 func (s *Server) saveState(stateStore StateStore) error {
 	return stateStore.Save()
 }
-
-// tokenRefGitHub is the tokenstore reference used for the GitHub primary token.
-const tokenRefGitHub = "github.primary"
 
 // hasScope reports whether scopes contains the required scope.
 func hasScope(scopes []string, required string) bool {

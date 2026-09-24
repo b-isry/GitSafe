@@ -202,7 +202,7 @@ func (s *Server) handleDriveCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := tokenStore.Set(tokenstore.DriveToken, result.RefreshToken); err != nil {
+	if err := tokenStore.Set(tokenstore.DriveTokenFor(sess.userID), result.RefreshToken); err != nil {
 		s.logger.Error("drive oauth: store refresh token", "cause", err)
 		s.driveError(w, "could not store the access token securely")
 		return
@@ -212,7 +212,7 @@ func (s *Server) handleDriveCallback(w http.ResponseWriter, r *http.Request) {
 		AccountEmail:    result.AccountEmail,
 		ConnectedAt:     time.Now(),
 		StorageFolderID: result.StorageFolderID,
-		TokenRef:        tokenstore.DriveToken,
+		TokenRef:        tokenstore.DriveTokenFor(sess.userID),
 	})
 	if err := s.saveState(stateStore); err != nil {
 		s.logger.Error("drive oauth: persist connection state", "cause", err)

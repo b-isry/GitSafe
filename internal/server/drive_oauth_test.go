@@ -72,7 +72,7 @@ func TestDriveCallbackExchangesAndConnects(t *testing.T) {
 
 	stores, _ := s.userStores.getOrCreate(42)
 	tk := stores.token
-	if v, err := tk.Get(tokenstore.DriveToken); err != nil || v != "rt-123" {
+	if v, err := tk.Get(tokenstore.DriveTokenFor(42)); err != nil || v != "rt-123" {
 		t.Fatalf("token store = %q, err=%v", v, err)
 	}
 	conn, ok := st.DriveConnection()
@@ -150,7 +150,7 @@ func TestDriveDisconnectRemovesTokenAndConnection(t *testing.T) {
 	}
 	stores, _ := s.userStores.getOrCreate(42)
 	tk := stores.token
-	if _, err := tk.Get(tokenstore.DriveToken); err == nil {
+	if _, err := tk.Get(tokenstore.DriveTokenFor(42)); err == nil {
 		t.Fatal("token should have been deleted")
 	}
 	if _, ok := st.DriveConnection(); ok {
@@ -192,7 +192,7 @@ func TestDriveDisconnectRevokeFailureStillDisconnects(t *testing.T) {
 	}
 	stores, _ := s.userStores.getOrCreate(42)
 	tk := stores.token
-	if _, err := tk.Get(tokenstore.DriveToken); err == nil {
+	if _, err := tk.Get(tokenstore.DriveTokenFor(42)); err == nil {
 		t.Fatal("token should have been deleted despite revocation failure")
 	}
 	if _, ok := st.DriveConnection(); ok {
@@ -211,7 +211,7 @@ func TestDriveDisconnectWithoutRevoker(t *testing.T) {
 	}
 	stores, _ := s.userStores.getOrCreate(42)
 	tk := stores.token
-	if _, err := tk.Get(tokenstore.DriveToken); err == nil {
+	if _, err := tk.Get(tokenstore.DriveTokenFor(42)); err == nil {
 		t.Fatal("token should have been deleted")
 	}
 	if _, ok := st.DriveConnection(); ok {

@@ -467,8 +467,8 @@ func TestGitHubCallbackSuccessPersists(t *testing.T) {
 	if conn.GitHubID != 42 || conn.Login != "octocat" || conn.Name != "Oc ToCat" {
 		t.Fatalf("identity not persisted: %+v", conn)
 	}
-	if conn.TokenRef != tokenstore.GitHubToken {
-		t.Fatalf("tokenRef = %q, want %q", conn.TokenRef, tokenstore.GitHubToken)
+	if conn.TokenRef != tokenstore.GitHubTokenFor(42) {
+		t.Fatalf("tokenRef = %q, want %q", conn.TokenRef, tokenstore.GitHubTokenFor(42))
 	}
 	if !slices.Contains(conn.Scopes, providers.ScopeRepo) {
 		t.Fatalf("repo scope not persisted: %v", conn.Scopes)
@@ -476,8 +476,8 @@ func TestGitHubCallbackSuccessPersists(t *testing.T) {
 	if !st.saved {
 		t.Fatal("expected state to be saved after connect")
 	}
-	if tk.data[tokenstore.GitHubToken] != "tok-999" {
-		t.Fatalf("token not stored in keychain: %q", tk.data[tokenstore.GitHubToken])
+	if tk.data[tokenstore.GitHubTokenFor(42)] != "tok-999" {
+		t.Fatalf("token not stored in keychain: %q", tk.data[tokenstore.GitHubTokenFor(42)])
 	}
 }
 
@@ -525,8 +525,8 @@ func TestGitHubCallbackStateSingleUse(t *testing.T) {
 func TestGitHubDisconnectClearsConnection(t *testing.T) {
 	st := &fakeStateStore{}
 	tk := newFakeTokenStore()
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
-	tk.data[tokenstore.GitHubToken] = "tok"
+	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubTokenFor(42)})
+	tk.data[tokenstore.GitHubTokenFor(42)] = "tok"
 	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
 
 	// Establish an authenticated session and fetch its CSRF token.
@@ -554,7 +554,7 @@ func TestGitHubDisconnectClearsConnection(t *testing.T) {
 	if st.hasGh {
 		t.Fatal("expected GitHub connection cleared")
 	}
-	if _, ok := tk.data[tokenstore.GitHubToken]; ok {
+	if _, ok := tk.data[tokenstore.GitHubTokenFor(42)]; ok {
 		t.Fatal("expected token removed from keychain")
 	}
 }
@@ -578,7 +578,7 @@ func TestRepositoriesDisconnected(t *testing.T) {
 
 func TestRepositoriesMissingToken(t *testing.T) {
 	st := &fakeStateStore{}
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
+	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubTokenFor(42)})
 	// Token store empty → missing token.
 	s := newCloudServer(t, st, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
 	cookie, _ := authedCookie(t, s, 42)

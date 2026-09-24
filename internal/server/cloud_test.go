@@ -365,9 +365,9 @@ func TestPushStaleness(t *testing.T) {
 
 func TestAPIRepositoriesIncludesStaleness(t *testing.T) {
 	st := &fakeStateStore{}
-	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubToken})
+	st.SetGitHubConnection(state.GitHubConnection{Login: "octocat", TokenRef: tokenstore.GitHubTokenFor(42)})
 	tk := newFakeTokenStore()
-	tk.data[tokenstore.GitHubToken] = "tok"
+	tk.data[tokenstore.GitHubTokenFor(42)] = "tok"
 	s := newCloudServer(t, st, tk, &GitHubOAuth{ClientID: "id"})
 	s.app.Config.Days = 30
 

@@ -19,23 +19,23 @@ func newIsolationServer(t *testing.T) *Server {
 	t.Helper()
 	st1 := &fakeStateStore{}
 	st1.SetGitHubConnection(state.GitHubConnection{
-		GitHubID: 1, Login: "octocat", TokenRef: tokenstore.GitHubToken,
+		GitHubID: 1, Login: "octocat", TokenRef: tokenstore.GitHubTokenFor(1),
 	})
 	st1.protected = []state.ProtectedRepo{
 		{ID: "u1-p1", GitHubID: 101, FullName: "u1/one", DefaultBranch: "main"},
 	}
 	tk1 := newFakeTokenStore()
-	tk1.data[tokenstore.GitHubToken] = "tok-1"
+	tk1.data[tokenstore.GitHubTokenFor(1)] = "tok-1"
 
 	st2 := &fakeStateStore{}
 	st2.SetGitHubConnection(state.GitHubConnection{
-		GitHubID: 2, Login: "octocat2", TokenRef: tokenstore.GitHubToken,
+		GitHubID: 2, Login: "octocat2", TokenRef: tokenstore.GitHubTokenFor(2),
 	})
 	st2.protected = []state.ProtectedRepo{
 		{ID: "u2-p1", GitHubID: 202, FullName: "u2/two", DefaultBranch: "main"},
 	}
 	tk2 := newFakeTokenStore()
-	tk2.data[tokenstore.GitHubToken] = "tok-2"
+	tk2.data[tokenstore.GitHubTokenFor(2)] = "tok-2"
 
 	s := newCloudServer(t, &fakeStateStore{}, newFakeTokenStore(), &GitHubOAuth{ClientID: "id"})
 	s.userStores.stores[1] = &userStores{state: st1, token: tk1}
