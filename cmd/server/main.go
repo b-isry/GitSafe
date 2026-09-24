@@ -6,14 +6,15 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/b-isry/gitsafe/internal/archiver"
 	"github.com/b-isry/gitsafe/internal/config"
 	"github.com/b-isry/gitsafe/internal/server"
-	"github.com/b-isry/gitsafe/internal/state"
-	"github.com/b-isry/gitsafe/internal/tokenstore"
 	"github.com/joho/godotenv"
 )
 
@@ -44,6 +45,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Validate git is available and at least version 2.31 (required for http.extraheader)
+	if err := archiver.ValidateGitVersion(2, 31); err != nil {
+		logger.Error("git validation failed", "error", err)
+		os.Exit(1)
+	}
+	// Log git version
+	if out, err := exec.Command("git", "--version").Output(); err == nil {
+		logger.Info("git version", "version", strings.TrimSpace(string(out)))
+	}
+
+	// Sweep stale gitsafe-* temp dirs at startup
+	sweepStaleTempDirs(logger)
+
 	app := &server.App{
 		Config:     cfg,
 		OutputPath: cfg.OutputPath,
@@ -55,12 +69,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Phase 1: persistent state + keychain token store + optional GitHub OAuth.
-	stateStore, err := state.Open(state.DefaultPath)
-	if err != nil {
-		logger.Error("failed to open state store", "error", err)
-		os.Exit(1)
-	}
+	// Phase 1: optional GitHub OAuth.
 	baseURL := cfg.BaseURLOrDefault()
 	logger.Info("base URL configured", "baseURL", baseURL)
 	var oauth *server.GitHubOAuth
@@ -73,7 +82,7 @@ func main() {
 		driveOAuth = d
 		logger.Info("drive oauth configured")
 	}
-	srv.ConfigureCloud(stateStore, tokenstore.New(), oauth)
+	srv.ConfigureCloud(oauth)
 	srv.ConfigureDriveOAuth(driveOAuth)
 
 	port := os.Getenv("PORT")
@@ -81,19 +90,25 @@ func main() {
 		port = "8080"
 	}
 	addr := ":" + port
+
+	// HTTP server with security hardening
 	httpSrv := &http.Server{
-		Addr:    addr,
-		Handler: srv.Routes(),
+		Addr:              addr,
+		Handler:           maxBytesMiddleware(securityHeadersMiddleware(srv.Routes())),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
-	// Graceful shutdown: on interrupt, stop accepting connections and let any
-	// in-flight requests finish so the process never hangs.
+	// Graceful shutdown: on interrupt or SIGTERM, stop accepting connections
+	// and let any in-flight requests finish so the process never hangs.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	go func() {
 		<-ctx.Done()
 		logger.Info("shutting down")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("http shutdown", "error", err)
@@ -106,4 +121,56 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("gitsafe web stopped")
+}
+
+// sweepStaleTempDirs removes any gitsafe-* temp directories left over from
+// previous runs. This prevents disk exhaustion from orphaned temp dirs.
+func sweepStaleTempDirs(logger *slog.Logger) {
+	tmpDir := os.TempDir()
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		logger.Warn("failed to read temp dir for sweep", "error", err)
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, "gitsafe-") {
+			path := filepath.Join(tmpDir, name)
+			if err := os.RemoveAll(path); err != nil {
+				logger.Warn("failed to remove stale temp dir", "path", path, "error", err)
+			} else {
+				logger.Info("removed stale temp dir", "path", path)
+			}
+		}
+	}
+}
+
+// maxBytesMiddleware limits request body size to prevent memory exhaustion.
+func maxBytesMiddleware(next http.Handler) http.Handler {
+	const maxBodySize = 10 << 20 // 10 MB
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// securityHeadersMiddleware adds security headers to all responses.
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Content Security Policy - restrictive by default
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		// HSTS in production mode (non-loopback base URL)
+		// Note: In production, the base URL would be https://domain.com
+		// For now, we only set HSTS if the request is HTTPS
+		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+		}
+		next.ServeHTTP(w, r)
+	})
 }

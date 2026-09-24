@@ -43,12 +43,40 @@ type Config struct {
 	GitHub     GitHubConfig     `yaml:"github,omitempty"`
 	DriveOAuth DriveOAuthConfig `yaml:"driveOAuth,omitempty"`
 	BaseURL    string           `yaml:"baseUrl,omitempty"`
+	// MaxRepoMB is the maximum repository size in MB that can be backed up.
+	// Repos larger than this are refused. Default 500.
+	MaxRepoMB int `yaml:"maxRepoMB,omitempty"`
+	// MaxProtectedRepos is the maximum number of repositories a user can protect.
+	// Default 50.
+	MaxProtectedRepos int `yaml:"maxProtectedRepos,omitempty"`
+	// BackupTimeoutMinutes is the maximum time allowed for a single backup
+	// (clone + bundle). Default 20.
+	BackupTimeoutMinutes int `yaml:"backupTimeoutMinutes,omitempty"`
+	// RateLimitRequests is the maximum number of requests per window for the
+	// API rate limiter. Default 60.
+	RateLimitRequests int `yaml:"rateLimitRequests,omitempty"`
+	// RateLimitWindowSeconds is the time window in seconds for the rate limiter.
+	// Default 60.
+	RateLimitWindowSeconds int `yaml:"rateLimitWindowSeconds,omitempty"`
+	// AuthRateLimitRequests is the maximum number of requests per window for
+	// auth endpoints (login, callback). Default 10.
+	AuthRateLimitRequests int `yaml:"authRateLimitRequests,omitempty"`
+	// AuthRateLimitWindowSeconds is the time window in seconds for auth rate limiter.
+	// Default 60.
+	AuthRateLimitWindowSeconds int `yaml:"authRateLimitWindowSeconds,omitempty"`
 }
 
 func Defaults() Config {
 	return Config{
-		Days:       30,
-		OutputPath: "./backups",
+		Days:                       30,
+		OutputPath:                 "./backups",
+		MaxRepoMB:                  500,
+		MaxProtectedRepos:          50,
+		BackupTimeoutMinutes:       20,
+		RateLimitRequests:          60,
+		RateLimitWindowSeconds:     60,
+		AuthRateLimitRequests:      10,
+		AuthRateLimitWindowSeconds: 60,
 		Cloud: CloudConfig{
 			Enabled:         false,
 			CredentialsFile: "credentials.json",
@@ -94,17 +122,31 @@ func (c Config) Save(path string) error {
 		CredentialsFile string `yaml:"credentialsFile"`
 	}
 	doc := struct {
-		OutputPath string           `yaml:"outputPath"`
-		Days       int              `yaml:"days"`
-		Cloud      cloudOut         `yaml:"cloud"`
-		GitHub     GitHubConfig     `yaml:"github,omitempty"`
-		DriveOAuth DriveOAuthConfig `yaml:"driveOAuth,omitempty"`
+		OutputPath                 string           `yaml:"outputPath"`
+		Days                       int              `yaml:"days"`
+		Cloud                      cloudOut         `yaml:"cloud"`
+		GitHub                     GitHubConfig     `yaml:"github,omitempty"`
+		DriveOAuth                 DriveOAuthConfig `yaml:"driveOAuth,omitempty"`
+		MaxRepoMB                  int              `yaml:"maxRepoMB,omitempty"`
+		MaxProtectedRepos          int              `yaml:"maxProtectedRepos,omitempty"`
+		BackupTimeoutMinutes       int              `yaml:"backupTimeoutMinutes,omitempty"`
+		RateLimitRequests          int              `yaml:"rateLimitRequests,omitempty"`
+		RateLimitWindowSeconds     int              `yaml:"rateLimitWindowSeconds,omitempty"`
+		AuthRateLimitRequests      int              `yaml:"authRateLimitRequests,omitempty"`
+		AuthRateLimitWindowSeconds int              `yaml:"authRateLimitWindowSeconds,omitempty"`
 	}{
-		OutputPath: c.OutputPath,
-		Days:       c.Days,
-		Cloud:      cloudOut{Enabled: c.Cloud.Enabled, CredentialsFile: c.Cloud.CredentialsFile},
-		GitHub:     c.GitHub,
-		DriveOAuth: c.DriveOAuth,
+		OutputPath:                 c.OutputPath,
+		Days:                       c.Days,
+		Cloud:                      cloudOut{Enabled: c.Cloud.Enabled, CredentialsFile: c.Cloud.CredentialsFile},
+		GitHub:                     c.GitHub,
+		DriveOAuth:                 c.DriveOAuth,
+		MaxRepoMB:                  c.MaxRepoMB,
+		MaxProtectedRepos:          c.MaxProtectedRepos,
+		BackupTimeoutMinutes:       c.BackupTimeoutMinutes,
+		RateLimitRequests:          c.RateLimitRequests,
+		RateLimitWindowSeconds:     c.RateLimitWindowSeconds,
+		AuthRateLimitRequests:      c.AuthRateLimitRequests,
+		AuthRateLimitWindowSeconds: c.AuthRateLimitWindowSeconds,
 	}
 
 	data, err := yaml.Marshal(doc)

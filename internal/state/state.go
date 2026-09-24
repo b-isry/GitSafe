@@ -295,6 +295,17 @@ func (s *Store) ClearDriveConnection() {
 	s.doc.Drive = nil
 }
 
+// ClearAll removes all user data from the store. Used for account deletion.
+func (s *Store) ClearAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.doc.GitHub = nil
+	s.doc.Drive = nil
+	s.doc.ProtectedRepos = nil
+	s.doc.BackupRecords = nil
+	s.doc.BackupJobs = nil
+}
+
 // --- Protected repositories ---
 
 func (s *Store) ProtectedRepos() []ProtectedRepo {
