@@ -87,7 +87,17 @@ uploaded to the connected account's Google Drive.
 - `.env`: deployment credentials (`GITSAFE_BASE_URL`, `GITSAFE_GITHUB_CLIENT_ID`,
   `GITSAFE_GITHUB_CLIENT_SECRET`, `GITSAFE_DRIVE_CLIENT_ID`,
   `GITSAFE_DRIVE_CLIENT_SECRET`)
+- `DATABASE_URL`: optional PostgreSQL connection string. When set, per-user
+  tokens and state use PostgreSQL. Production requires it; local development
+  falls back to file-backed state and encrypted file or OS-keyring tokens.
+- `GITSAFE_TOKEN_KEY`: required with `DATABASE_URL` and in production. It
+  derives the AES-256 key used to encrypt database-backed tokens.
+- `GITSAFE_DATA_DIR`: optional local directory for the file-backed token fallback.
 - `PORT`: port to bind the HTTP server (default: 8080). On Render this is set automatically.
+
+The required PostgreSQL tables are created with `CREATE TABLE IF NOT EXISTS`
+at server startup. A failed connection or startup round-trip prevents the
+server from starting.
 
 ## Render Deployment
 
@@ -100,12 +110,27 @@ On Render, set the following environment variables:
 | `GITSAFE_GITHUB_CLIENT_SECRET` | GitHub OAuth App Client Secret | `...` |
 | `GITSAFE_DRIVE_CLIENT_ID` | Google Drive OAuth Client ID | `...` |
 | `GITSAFE_DRIVE_CLIENT_SECRET` | Google Drive OAuth Client Secret | `...` |
+| `GITSAFE_TOKEN_KEY` | **Required.** AES encryption key for OAuth tokens. | `...` |
+| `DATABASE_URL` | **Required.** External PostgreSQL connection string. | `postgresql://...` |
 
 Register the GitHub and Google OAuth redirect URIs using your `GITSAFE_BASE_URL`:
 - GitHub: `https://gitsafe.onrender.com/api/auth/github/callback`
 - Google Drive: `https://gitsafe.onrender.com/api/auth/drive/callback`
 
 The `PORT` variable is automatically provided by Render and does not need to be set manually.
+
+## Testing
+
+PostgreSQL integration tests require a running PostgreSQL database. They are
+excluded from the default test run with the `postgres` build tag:
+
+```bash
+GITSAFE_TEST_DATABASE_URL='postgresql://postgres:postgres@127.0.0.1:5432/gitsafe_test?sslmode=disable' \
+  go test -tags=postgres -count=1 ./...
+```
+
+The test database must allow the test user to create and drop rows in the
+`user_tokens` and `user_state` tables.
 
 ## Contributing
 

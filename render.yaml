@@ -18,20 +18,9 @@ services:
         sync: false
       - key: GITSAFE_DRIVE_CLIENT_SECRET
         sync: false
-      # Encryption key material for the token file store (Required in production).
-      # Without it the server refuses to boot: tokens are persisted AES-256-GCM-
-      # encrypted under GITSAFE_DATA_DIR, and no OS keyring exists in the container.
+      # Encryption key material for PostgreSQL-backed tokens (required in production).
       # Generate with: openssl rand -hex 32
       - key: GITSAFE_TOKEN_KEY
         sync: false
-      # Directory for the encrypted per-user token files. Mount the persistent
-      # disk here so tokens survive deploys/restarts.
-      - key: GITSAFE_DATA_DIR
-        value: /var/data
-    # Note: Persistent disks require a paid plan on Render.
-    # Add a disk to the service and mount it at /var/data for persistent storage.
-    # The service should be limited to a single instance (scaling not supported with single disk).
-    disk:
-      name: gitsafe-data
-      mountPath: /var/data
-      sizeGB: 10
+      - key: DATABASE_URL
+        sync: false

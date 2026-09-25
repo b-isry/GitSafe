@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -12,9 +14,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	postgresdb "github.com/b-isry/gitsafe/internal/postgres"
 	"github.com/b-isry/gitsafe/internal/providers"
 	"github.com/b-isry/gitsafe/internal/state"
 	"github.com/b-isry/gitsafe/internal/tokenstore"
@@ -28,6 +32,7 @@ type Server struct {
 	logger     *slog.Logger
 	app        *App
 	configPath string
+	db         *sql.DB
 
 	sessions   *sessionManager
 	userStores *UserStoreManager
@@ -113,17 +118,12 @@ type renderData struct {
 	Cloud CloudView
 }
 
-// TokenStoreFactory returns the per-user token store backend. It is called on
-// each user's first access so the server can keep one FileStore instance or
-// build fresh keyring handles without tests touching the real OS keychain.
-type TokenStoreFactory func() (TokenStore, error)
+type TokenStoreFactory func(userID int64) (TokenStore, error)
+type StateStoreFactory func(userID int64) (StateStore, error)
 
-// Options configures Server construction. Zero value selects the
-// environment-derived token backend (see tokenStoreFactoryFromEnv).
 type Options struct {
-	// TokenStore overrides the token backend selection. Tests inject fakes here
-	// so the construction self-test never touches a live OS keychain.
 	TokenStore TokenStoreFactory
+	StateStore StateStoreFactory
 }
 
 // UserStoreManager manages per-user state and token stores.
@@ -133,6 +133,7 @@ type UserStoreManager struct {
 	stores       map[int64]*userStores
 	basePath     string
 	logger       *slog.Logger
+	stateFactory StateStoreFactory
 	tokenFactory TokenStoreFactory
 }
 
@@ -148,6 +149,10 @@ func NewUserStoreManager(basePath string, logger *slog.Logger) *UserStoreManager
 		stores:   make(map[int64]*userStores),
 		basePath: basePath,
 		logger:   logger,
+		stateFactory: func(userID int64) (StateStore, error) {
+			statePath := filepath.Join(basePath, fmt.Sprintf("state-%d.json", userID))
+			return state.Open(statePath)
+		},
 	}
 }
 
@@ -169,20 +174,21 @@ func (m *UserStoreManager) getOrCreate(userID int64) (*userStores, error) {
 		return stores, nil
 	}
 
-	// Create per-user state file path: .gitsafe/state-{userID}.json
-	statePath := filepath.Join(m.basePath, fmt.Sprintf("state-%d.json", userID))
-	st, err := state.Open(statePath)
+	stateFactory := m.stateFactory
+	if stateFactory == nil {
+		statePath := filepath.Join(m.basePath, fmt.Sprintf("state-%d.json", userID))
+		stateFactory = func(int64) (StateStore, error) { return state.Open(statePath) }
+	}
+	st, err := stateFactory(userID)
 	if err != nil {
 		return nil, fmt.Errorf("open user state store: %w", err)
 	}
 
 	factory := m.tokenFactory
 	if factory == nil {
-		// Defensive fallback for direct manager construction; production and
-		// tests go through New/NewWithOptions which always set a factory.
-		factory = func() (TokenStore, error) { return tokenstore.New(), nil }
+		factory = func(int64) (TokenStore, error) { return tokenstore.New(), nil }
 	}
-	tokenStore, err := factory()
+	tokenStore, err := factory(userID)
 	if err != nil {
 		return nil, fmt.Errorf("create user token store: %w", err)
 	}
@@ -239,6 +245,37 @@ func New(logger *slog.Logger, app *App, configPath string) (*Server, error) {
 // has no Secret Service) refuses startup with an error instead of failing at
 // the first login.
 func NewWithOptions(logger *slog.Logger, app *App, configPath string, opts Options) (*Server, error) {
+	if app == nil {
+		return nil, errors.New("server: app is required")
+	}
+	if err := validateDeploymentEnvironment(app.Config.BaseURLOrDefault()); err != nil {
+		return nil, err
+	}
+
+	var db *sql.DB
+	databaseURL := strings.TrimSpace(os.Getenv(DatabaseURLEnv))
+	if databaseURL != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		var err error
+		db, err = postgresdb.Open(ctx, databaseURL)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		if err := postgresdb.EnsureSchema(ctx, db); err != nil {
+			cancel()
+			_ = db.Close()
+			return nil, err
+		}
+		cancel()
+	}
+	keepDatabase := false
+	defer func() {
+		if !keepDatabase && db != nil {
+			_ = db.Close()
+		}
+	}()
+
 	tmpls := make(map[string]*template.Template, len(pages))
 	for _, p := range pages {
 		t, err := template.New("gitsafe").ParseFS(
@@ -251,23 +288,44 @@ func NewWithOptions(logger *slog.Logger, app *App, configPath string, opts Optio
 	if configPath == "" {
 		configPath = ConfigPathFile
 	}
-	// Determine base path for per-user state files
-	// Use the directory of the config file, or default to .gitsafe
 	basePath := filepath.Dir(configPath)
 	if basePath == "." {
 		basePath = ".gitsafe"
 	}
 
-	factory := opts.TokenStore
-	if factory == nil {
+	tokenFactory := opts.TokenStore
+	if tokenFactory == nil {
 		var err error
-		factory, err = tokenStoreFactoryFromEnv(basePath)
+		tokenFactory, err = tokenStoreFactoryFromEnv(db, basePath)
 		if err != nil {
 			return nil, fmt.Errorf("configure token store: %w", err)
 		}
 	}
-	if err := probeTokenStore(factory); err != nil {
+	stateFactory := opts.StateStore
+	if stateFactory == nil {
+		if db != nil {
+			stateFactory = func(userID int64) (StateStore, error) {
+				return state.OpenPostgres(db, userID)
+			}
+		} else {
+			stateFactory = func(userID int64) (StateStore, error) {
+				statePath := filepath.Join(basePath, fmt.Sprintf("state-%d.json", userID))
+				return state.Open(statePath)
+			}
+		}
+	}
+
+	probeUserID := time.Now().UnixNano()
+	if probeUserID <= 0 {
+		probeUserID = -probeUserID
+	}
+	if err := probeTokenStore(tokenFactory, probeUserID); err != nil {
 		return nil, fmt.Errorf("token store self-test: %w", err)
+	}
+	if db != nil {
+		if err := probeStateStore(stateFactory, probeUserID); err != nil {
+			return nil, fmt.Errorf("state store self-test: %w", err)
+		}
 	}
 
 	srv := &Server{
@@ -275,30 +333,35 @@ func NewWithOptions(logger *slog.Logger, app *App, configPath string, opts Optio
 		logger:       logger,
 		app:          app,
 		configPath:   configPath,
+		db:           db,
 		sessions:     newSessionManager(),
 		userStores:   NewUserStoreManager(basePath, logger),
 		bundleBackup: defaultBundleBackup,
 		backupSem:    make(chan struct{}, maxConcurrentBackups),
 		jobProgress:  make(map[string]jobProgressMetrics),
 		userBackups:  make(map[int64]int),
-		repoSize:     nil, // nil means use default implementation
+		repoSize:     nil,
 	}
-	srv.userStores.tokenFactory = factory
+	srv.userStores.tokenFactory = tokenFactory
+	srv.userStores.stateFactory = stateFactory
 	srv.githubLister = func(ctx context.Context, token string) ([]providers.Repository, error) {
 		return srv.githubClientFor(token).ListRepositories(ctx)
 	}
+	keepDatabase = true
 	return srv, nil
 }
 
-// probeTokenStore exercises the selected backend with a throwaway reference.
-// Any failure (construction, Set, Get, Delete, or a wrong read-back) refuses
-// the boot.
-func probeTokenStore(factory TokenStoreFactory) error {
-	st, err := factory()
+func probeTokenStore(factory TokenStoreFactory, userID int64) (err error) {
+	st, err := factory(userID)
 	if err != nil {
 		return fmt.Errorf("create backend: %w", err)
 	}
 	ref := "__gitsafe_probe_" + randToken(8)
+	defer func() {
+		if cleanupErr := st.Delete(ref); err == nil && cleanupErr != nil {
+			err = fmt.Errorf("delete: %w", cleanupErr)
+		}
+	}()
 	if err := st.Set(ref, "probe"); err != nil {
 		return fmt.Errorf("set: %w", err)
 	}
@@ -309,10 +372,47 @@ func probeTokenStore(factory TokenStoreFactory) error {
 	if got != "probe" {
 		return fmt.Errorf("read-back mismatch: got %q", got)
 	}
-	if err := st.Delete(ref); err != nil {
-		return fmt.Errorf("delete: %w", err)
+	return nil
+}
+
+func probeStateStore(factory StateStoreFactory, userID int64) (err error) {
+	st, err := factory(userID)
+	if err != nil {
+		return fmt.Errorf("create backend: %w", err)
+	}
+	if cleaner, ok := st.(interface{ Delete() error }); ok {
+		defer func() {
+			if cleanupErr := cleaner.Delete(); err == nil && cleanupErr != nil {
+				err = fmt.Errorf("delete: %w", cleanupErr)
+			}
+		}()
+	}
+	connection := state.GitHubConnection{
+		GitHubID:    userID,
+		Login:       "__gitsafe_probe__",
+		ConnectedAt: time.Now().UTC(),
+		TokenRef:    "__gitsafe_state_probe__",
+	}
+	st.SetGitHubConnection(connection)
+	if err := st.Save(); err != nil {
+		return fmt.Errorf("save: %w", err)
+	}
+	reloaded, err := factory(userID)
+	if err != nil {
+		return fmt.Errorf("reload: %w", err)
+	}
+	got, ok := reloaded.GitHubConnection()
+	if !ok || got.GitHubID != userID || got.Login != connection.Login || got.TokenRef != connection.TokenRef {
+		return errors.New("read-back mismatch")
 	}
 	return nil
+}
+
+func (s *Server) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
 }
 
 func (s *Server) Routes() http.Handler {

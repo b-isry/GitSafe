@@ -31,7 +31,7 @@ func newTestApp(t *testing.T, root, out string) *Server {
 	// Inject an in-memory token backend so the construction self-test and any
 	// getOrCreate fall-through never touch a live OS keychain during tests.
 	s, err := NewWithOptions(slog.New(slog.NewTextHandler(io.Discard, nil)), app, filepath.Join(t.TempDir(), "config.yaml"), Options{
-		TokenStore: func() (TokenStore, error) { return newFakeTokenStore(), nil },
+		TokenStore: func(int64) (TokenStore, error) { return newFakeTokenStore(), nil },
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

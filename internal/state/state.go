@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
@@ -30,14 +28,14 @@ var (
 // running when GitSafe shut down.
 const interruptedMessage = "interrupted by shutdown; no automatic resume"
 
-// Store is a serialized, atomic JSON state store. All access is guarded by a
-// mutex so concurrent goroutines cannot corrupt state. Callers mutate in
-// memory, then call Save to persist atomically (mirroring the existing
-// config.Save pattern).
+// Store is a serialized JSON state document. All access is guarded by a mutex
+// so concurrent goroutines cannot corrupt state. Callers mutate in memory,
+// then call Save to persist through the configured backend.
 type Store struct {
-	mu   sync.RWMutex
-	path string
-	doc  document
+	mu      sync.RWMutex
+	path    string
+	backend persistenceBackend
+	doc     document
 }
 
 // Open loads the state at path, or initializes a clean empty document when no
@@ -50,23 +48,7 @@ func Open(path string) (*Store, error) {
 	if path == "" {
 		return nil, fmt.Errorf("state: empty path")
 	}
-	s := &Store{path: path, doc: cleanDocument()}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// First run: no file, clean initialized state. Not written to disk
-			// until the first Save.
-			return s, nil
-		}
-		return nil, fmt.Errorf("state: read %q: %w", path, err)
-	}
-
-	if err := s.decode(data); err != nil {
-		return nil, err
-	}
-	s.normalizeInterrupted()
-	return s, nil
+	return openStore(path, &filePersistenceBackend{path: path})
 }
 
 // Path returns the state file location.
@@ -198,8 +180,8 @@ func (s *Store) Document() Document {
 	return d
 }
 
-// Save serializes and atomically replaces the state file. On any failure the
-// previous valid file remains intact.
+// Save persists the current document. File persistence atomically replaces the
+// file; PostgreSQL persistence atomically upserts the user row.
 func (s *Store) Save() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -207,46 +189,11 @@ func (s *Store) Save() error {
 }
 
 func (s *Store) saveLocked() error {
-	parent := filepath.Dir(s.path)
-	if err := os.MkdirAll(parent, 0o755); err != nil {
-		return fmt.Errorf("state: create directory %q: %w", parent, err)
-	}
-
 	data, err := json.MarshalIndent(s.doc, "", "  ")
 	if err != nil {
 		return fmt.Errorf("state: marshal: %w", err)
 	}
-
-	tmp, err := os.CreateTemp(parent, ".gitsafe-state-*.tmp")
-	if err != nil {
-		return fmt.Errorf("state: create temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-	// Ensure the temp file is cleaned up on any failure so it never becomes a
-	// primary state file.
-	defer func() {
-		if tmp != nil {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("state: write temp file: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("state: sync temp file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("state: close temp file: %w", err)
-	}
-
-	if err := os.Rename(tmpName, s.path); err != nil {
-		return fmt.Errorf("state: replace %q: %w", s.path, err)
-	}
-	tmp = nil // success; temp already renamed away
-	return nil
+	return s.backend.save(data)
 }
 
 // --- Connections ---

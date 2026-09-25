@@ -1,22 +1,11 @@
 // Package tokenstore persists OAuth access tokens behind a uniform Store
-// interface. Two backends exist:
+// interface. KeyringStore is the local keychain fallback, FileStore is the
+// local encrypted-file fallback, and PostgresTokenStore stores AES-256-GCM
+// nonce and ciphertext columns in PostgreSQL.
 //
-//   - KeyringStore keeps tokens in the OS keychain through go-keyring (used in
-//     local development).
-//   - FileStore keeps tokens in AES-256-GCM-encrypted files (used in production
-//     deployments, and required there because headless containers usually have
-//     no Secret Service/dbus to back the keyring).
-//
-// GitSafe deliberately does NOT store tokens in config.yaml, state.json, logs,
-// cookies, temporary files, or any database/state structure. Only a token
-// reference (for example "github.42") lives in the state layer; the token
-// value itself is held here and encrypted by the operator-supplied key or the
-// operating system.
-//
-// Token references are per-user (see GitHubTokenFor and DriveTokenFor) so
-// distinct accounts never share a storage entry. Backends are selected at
-// server construction from the deployment environment; server.New refuses to
-// boot if the selected backend fails a Set/Get/Delete self-test.
+// Tokens are never written to config files, state, logs, cookies, or temporary
+// files. State contains only per-user token references. Backends are selected
+// at server construction and receive a Set/Get/Delete startup self-test.
 package tokenstore
 
 import (

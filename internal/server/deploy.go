@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"fmt"
 	"net"
 	"net/url"
@@ -21,8 +22,10 @@ const (
 
 	// TokenDataDirEnv overrides the directory where the encrypted token files
 	// live. When unset, the server's state base path (the directory of the
-	// config file) is used. On Render, mount the persistent disk here.
+	// config file) is used.
 	TokenDataDirEnv = "GITSAFE_DATA_DIR"
+
+	DatabaseURLEnv = "DATABASE_URL"
 )
 
 // IsLoopbackHost reports whether baseURL points at the local machine
@@ -46,18 +49,38 @@ func IsLoopbackHost(rawURL string) bool {
 	return false
 }
 
-// tokenStoreFactoryFromEnv selects the token backend from the deployment
-// environment:
-//
-//   - GITSAFE_TOKEN_KEY set   → the encrypted FileStore (production).
-//   - GITSAFE_TOKEN_KEY unset → the OS keyring (local development).
-//
-// The file store root is GITSAFE_DATA_DIR when set, otherwise defaultDir (the
-// server's state base path).
-func tokenStoreFactoryFromEnv(defaultDir string) (TokenStoreFactory, error) {
+func validateDeploymentEnvironment(baseURL string) error {
+	production := !IsLoopbackHost(baseURL)
+	databaseConfigured := strings.TrimSpace(os.Getenv(DatabaseURLEnv)) != ""
+	tokenKeyConfigured := os.Getenv(TokenKeyEnv) != ""
+	if production {
+		var missing []string
+		if !databaseConfigured {
+			missing = append(missing, DatabaseURLEnv)
+		}
+		if !tokenKeyConfigured {
+			missing = append(missing, TokenKeyEnv)
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("server: refusing to boot production deployment: %s required", strings.Join(missing, " and "))
+		}
+		return nil
+	}
+	if databaseConfigured && !tokenKeyConfigured {
+		return fmt.Errorf("server: refusing to boot with PostgreSQL persistence: %s is required", TokenKeyEnv)
+	}
+	return nil
+}
+
+func tokenStoreFactoryFromEnv(db *sql.DB, defaultDir string) (TokenStoreFactory, error) {
 	key := os.Getenv(TokenKeyEnv)
+	if db != nil {
+		return func(userID int64) (TokenStore, error) {
+			return tokenstore.NewPostgresStore(db, userID, key)
+		}, nil
+	}
 	if key == "" {
-		return func() (TokenStore, error) { return tokenstore.New(), nil }, nil
+		return func(int64) (TokenStore, error) { return tokenstore.New(), nil }, nil
 	}
 	dir := os.Getenv(TokenDataDirEnv)
 	if dir == "" {
@@ -67,5 +90,5 @@ func tokenStoreFactoryFromEnv(defaultDir string) (TokenStoreFactory, error) {
 	if err != nil {
 		return nil, fmt.Errorf("file store: %w", err)
 	}
-	return func() (TokenStore, error) { return st, nil }, nil
+	return func(int64) (TokenStore, error) { return st, nil }, nil
 }

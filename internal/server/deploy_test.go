@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/b-isry/gitsafe/internal/config"
+	"github.com/b-isry/gitsafe/internal/state"
 	"github.com/b-isry/gitsafe/internal/tokenstore"
 )
 
@@ -56,11 +57,11 @@ func TestTokenStoreFactoryFromEnvFileStore(t *testing.T) {
 	t.Setenv(TokenKeyEnv, "deployment-key")
 	t.Setenv(TokenDataDirEnv, dir)
 
-	factory, err := tokenStoreFactoryFromEnv(t.TempDir())
+	factory, err := tokenStoreFactoryFromEnv(nil, t.TempDir())
 	if err != nil {
 		t.Fatalf("tokenStoreFactoryFromEnv: %v", err)
 	}
-	st, err := factory()
+	st, err := factory(42)
 	if err != nil {
 		t.Fatalf("factory(): %v", err)
 	}
@@ -82,11 +83,11 @@ func TestTokenStoreFactoryFromEnvFileStore(t *testing.T) {
 func TestTokenStoreFactoryFromEnvKeyringWhenNoKey(t *testing.T) {
 	t.Setenv(TokenKeyEnv, "")
 	t.Setenv(TokenDataDirEnv, "")
-	factory, err := tokenStoreFactoryFromEnv(t.TempDir())
+	factory, err := tokenStoreFactoryFromEnv(nil, t.TempDir())
 	if err != nil {
 		t.Fatalf("tokenStoreFactoryFromEnv: %v", err)
 	}
-	st, err := factory()
+	st, err := factory(42)
 	if err != nil {
 		t.Fatalf("factory(): %v", err)
 	}
@@ -95,11 +96,9 @@ func TestTokenStoreFactoryFromEnvKeyringWhenNoKey(t *testing.T) {
 	}
 }
 
-// TestNewUsesFileStoreInProduction verifies the public New constructor picks the
-// encrypted file store from the environment and that its startup self-test
-// round-trips against that backend (leaving a real token file on disk).
-func TestNewUsesFileStoreInProduction(t *testing.T) {
+func TestNewUsesFileStoresWhenDatabaseURLUnset(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "tokens")
+	t.Setenv(DatabaseURLEnv, "")
 	t.Setenv(TokenKeyEnv, "deployment-key")
 	t.Setenv(TokenDataDirEnv, dir)
 
@@ -107,12 +106,19 @@ func TestNewUsesFileStoreInProduction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New with file-store env: %v", err)
 	}
-	st, err := s.userStores.tokenFactory()
+	st, err := s.userStores.tokenFactory(7)
 	if err != nil {
 		t.Fatalf("tokenFactory(): %v", err)
 	}
 	if _, ok := st.(*tokenstore.FileStore); !ok {
 		t.Fatalf("New must select the file store when key set, got %T", st)
+	}
+	stateStore, err := s.userStores.stateFactory(7)
+	if err != nil {
+		t.Fatalf("stateFactory(): %v", err)
+	}
+	if _, ok := stateStore.(*state.Store); !ok {
+		t.Fatalf("New must select the file state store without DATABASE_URL, got %T", stateStore)
 	}
 	if err := st.Set("github.7", "persisted"); err != nil {
 		t.Fatal(err)
@@ -150,11 +156,11 @@ func (droppingTokenStore) Delete(ref string) error { return nil }
 func TestNewRefusesBootWhenProbeFails(t *testing.T) {
 	cases := []struct {
 		name    string
-		factory func() (TokenStore, error)
+		factory func(int64) (TokenStore, error)
 	}{
-		{"set always fails", func() (TokenStore, error) { return errTokenStore{}, nil }},
-		{"get always fails", func() (TokenStore, error) { return droppingTokenStore{}, nil }},
-		{"factory errors", func() (TokenStore, error) { return nil, errors.New("no backend") }},
+		{"set always fails", func(int64) (TokenStore, error) { return errTokenStore{}, nil }},
+		{"get always fails", func(int64) (TokenStore, error) { return droppingTokenStore{}, nil }},
+		{"factory errors", func(int64) (TokenStore, error) { return nil, errors.New("no backend") }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -176,12 +182,67 @@ func TestNewRefusesBootWhenProbeFails(t *testing.T) {
 // the store was unreachable (not merely misconfigured).
 func TestNewRefusesBootOnSetFailurePinsMessage(t *testing.T) {
 	_, err := NewWithOptions(discardLogger(), newDeployApp(t), filepath.Join(t.TempDir(), "config.yaml"), Options{
-		TokenStore: func() (TokenStore, error) { return errTokenStore{}, nil },
+		TokenStore: func(int64) (TokenStore, error) { return errTokenStore{}, nil },
 	})
 	if err == nil {
 		t.Fatal("expected boot refusal")
 	}
 	if got := err.Error(); !strings.Contains(got, "backend boom") {
 		t.Fatalf("unexpected probe error: %v", got)
+	}
+}
+
+func TestNewRefusesProductionWithoutDatabaseURL(t *testing.T) {
+	app := newDeployApp(t)
+	app.Config.BaseURL = "https://gitsafe.example.com"
+	t.Setenv(DatabaseURLEnv, "")
+	t.Setenv(TokenKeyEnv, "deployment-key")
+
+	_, err := NewWithOptions(discardLogger(), app, filepath.Join(t.TempDir(), "config.yaml"), Options{
+		TokenStore: func(int64) (TokenStore, error) { return newFakeTokenStore(), nil },
+		StateStore: func(int64) (StateStore, error) { return &fakeStateStore{}, nil },
+	})
+	if err == nil || !strings.Contains(err.Error(), DatabaseURLEnv) {
+		t.Fatalf("production boot without DATABASE_URL must fail clearly, got %v", err)
+	}
+}
+
+func TestNewRefusesProductionWithoutTokenKeyOrDatabaseURL(t *testing.T) {
+	app := newDeployApp(t)
+	app.Config.BaseURL = "https://gitsafe.example.com"
+	t.Setenv(DatabaseURLEnv, "")
+	t.Setenv(TokenKeyEnv, "")
+
+	_, err := NewWithOptions(discardLogger(), app, filepath.Join(t.TempDir(), "config.yaml"), Options{
+		TokenStore: func(int64) (TokenStore, error) { return newFakeTokenStore(), nil },
+		StateStore: func(int64) (StateStore, error) { return &fakeStateStore{}, nil },
+	})
+	if err == nil {
+		t.Fatal("production boot must fail")
+	}
+	for _, env := range []string{DatabaseURLEnv, TokenKeyEnv} {
+		if !strings.Contains(err.Error(), env) {
+			t.Fatalf("boot error %q does not name %s", err, env)
+		}
+	}
+}
+
+func TestNewRequiresTokenKeyForPostgresOnLoopback(t *testing.T) {
+	t.Setenv(DatabaseURLEnv, "postgresql://example.invalid/gitsafe")
+	t.Setenv(TokenKeyEnv, "")
+
+	_, err := New(discardLogger(), newDeployApp(t), filepath.Join(t.TempDir(), "config.yaml"))
+	if err == nil || !strings.Contains(err.Error(), TokenKeyEnv) {
+		t.Fatalf("PostgreSQL boot without token key must fail clearly, got %v", err)
+	}
+}
+
+func TestNewRefusesBootWhenDatabaseUnreachable(t *testing.T) {
+	t.Setenv(DatabaseURLEnv, "postgresql://postgres:postgres@127.0.0.1:1/gitsafe?connect_timeout=1")
+	t.Setenv(TokenKeyEnv, "deployment-key")
+
+	_, err := New(discardLogger(), newDeployApp(t), filepath.Join(t.TempDir(), "config.yaml"))
+	if err == nil || !strings.Contains(err.Error(), "database unreachable") {
+		t.Fatalf("unreachable database must prevent boot, got %v", err)
 	}
 }
