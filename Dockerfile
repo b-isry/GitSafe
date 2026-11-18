@@ -17,7 +17,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o gitsafe ./cmd/server
 
 # Final stage
-FROM alpine:3.20
+FROM alpine:3.24
 
 # Install git, ca-certificates for runtime, and su-exec for privilege dropping
 RUN apk add --no-cache git ca-certificates su-exec
