@@ -1,0 +1,14 @@
+credentials.json
+backups/
+/bin/
+.env
+.gitsafe/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.test
+*.out
+coverage.txt
+*.exe
+*.log

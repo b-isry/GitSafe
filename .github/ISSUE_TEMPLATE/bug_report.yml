@@ -1,0 +1,67 @@
+name: Bug report
+description: Something in GitSafe doesn't work as expected
+title: "bug: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Security issues must be reported privately** (see SECURITY.md).
+        Never paste tokens, secrets, cookies or OAuth codes: redact them.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Sign in with GitHub
+        2. Click "Back up all" with destination Google Drive
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where are you running GitSafe?
+      options:
+        - Cloud deployment (e.g. Render, Railway, other)
+        - Self-hosted (Docker, custom server)
+        - Local development (127.0.0.1)
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - GitHub sign-in / OAuth
+        - Google Drive connection
+        - Backups (manual)
+        - Daily backups
+        - Local download destination
+        - UI
+        - Deployment / configuration
+        - Other
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Commit SHA or date of the deployment, if known.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or error messages
+      description: Server log lines or the error shown in the UI (redact tokens and emails).
+      render: text
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and OS
+      placeholder: Firefox 131 on Ubuntu 24.04

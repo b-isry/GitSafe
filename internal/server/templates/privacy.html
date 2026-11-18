@@ -1,0 +1,28 @@
+{{define "content"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy · GitSafe</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header>
+  <a href="/">GitSafe</a>
+</header>
+<main>
+  <h1>Privacy</h1>
+  <p>GitSafe is a GitHub repository backup tool.</p>
+  <p>Users connect their Google Drive through Google OAuth.</p>
+  <p>GitSafe uses the requested Google Drive permissions to store Git repository backups in the user's Drive.</p>
+  <p>GitSafe stores your GitHub access token and Google refresh token encrypted in its database so it can run backups you start and, if you turn on daily backups, back up your repositories once a day while you are signed out. Disconnecting an account or deleting your GitSafe account removes the stored tokens.</p>
+  <p>GitSafe uses a signed cookie to keep you signed in. It contains no OAuth tokens.</p>
+  <p>GitSafe does not sell user data.</p>
+  <p>Users can revoke Google's access to GitSafe through their Google Account.</p>
+  <p>GitSafe is currently a prototype/beta.</p>
+  <p>Last updated: {{.LastUpdated}}</p>
+</main>
+</body>
+</html>
+{{end}}

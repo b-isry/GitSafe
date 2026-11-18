@@ -1,0 +1,52 @@
+# Local development only. Never use these settings in production.
+#
+#   make db-up          # PostgreSQL on 127.0.0.1:5432 (user/password/db: gitsafe)
+#   make run            # app on http://127.0.0.1:8080 using .env
+#
+# Put DATABASE_URL=postgresql://gitsafe:gitsafe@127.0.0.1:5432/gitsafe?sslmode=disable
+# and a throwaway GITSAFE_TOKEN_KEY in your .env (see .env.example).
+#
+# Optional: run the app in a container too (Linux only, see CONTRIBUTING.md):
+#   docker compose --profile app up --build
+# It uses host networking because a local GitSafe install (loopback
+# GITSAFE_BASE_URL) only accepts connections from 127.0.0.1, and Docker's port
+# publishing would make requests arrive from the bridge network instead.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gitsafe
+      POSTGRES_PASSWORD: gitsafe
+      POSTGRES_DB: gitsafe
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - gitsafe-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gitsafe -d gitsafe"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    profiles: ["app"]
+    build: .
+    network_mode: host
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      GITSAFE_BASE_URL: http://127.0.0.1:8080
+      PORT: "8080"
+      DATABASE_URL: postgresql://gitsafe:gitsafe@127.0.0.1:5432/gitsafe?sslmode=disable
+      GITSAFE_TOKEN_KEY: ${GITSAFE_TOKEN_KEY:?set a throwaway GITSAFE_TOKEN_KEY in .env (openssl rand -hex 32)}
+      GITSAFE_DATA_DIR: /var/data
+    volumes:
+      - gitsafe-data:/var/data
+
+volumes:
+  gitsafe-db:
+  gitsafe-data:

@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Lint, build, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gitsafe
+          POSTGRES_PASSWORD: gitsafe
+          POSTGRES_DB: gitsafe_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gitsafe -d gitsafe_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted (run 'make fmt'):"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: |
+          go vet ./...
+          go vet -tags=postgres ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -count=1 -timeout 180s ./...
+
+      - name: Test (race)
+        run: go test -count=1 -race -timeout 300s ./...
+
+      - name: Test (PostgreSQL integration)
+        env:
+          GITSAFE_TEST_DATABASE_URL: postgresql://gitsafe:gitsafe@localhost:5432/gitsafe_test?sslmode=disable
+        run: go test -tags=postgres -count=1 -p 1 -timeout 300s ./...

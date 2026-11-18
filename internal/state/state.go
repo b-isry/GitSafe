@@ -1,0 +1,515 @@
+package state
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"sync"
+	"time"
+)
+
+// Sentinel errors surfaced by the store.
+var (
+	// ErrCorruptState is returned when an existing state file cannot be parsed
+	// as structurally valid state. The existing file is left untouched.
+	ErrCorruptState = errors.New("state: state file is corrupt or structurally invalid")
+	// ErrUnsupportedVersion is returned when the persisted schema version is
+	// missing or not supported by this build.
+	ErrUnsupportedVersion = errors.New("state: unsupported schema version")
+	// ErrNotFound is returned when a requested entity does not exist.
+	ErrNotFound = errors.New("state: not found")
+	// ErrDuplicate is returned when adding an entity that already exists.
+	ErrDuplicate = errors.New("state: duplicate entity")
+)
+
+// interruptedMessage is the fixed, sanitized message applied to jobs that were
+// running when GitSafe shut down.
+const interruptedMessage = "interrupted by shutdown; no automatic resume"
+
+// Store is a serialized JSON state document. All access is guarded by a mutex
+// so concurrent goroutines cannot corrupt state. Callers mutate in memory,
+// then call Save to persist through the configured backend.
+type Store struct {
+	mu      sync.RWMutex
+	path    string
+	backend persistenceBackend
+	doc     document
+}
+
+// Open loads the state at path, or initializes a clean empty document when no
+// state exists yet. On load, jobs that were not in a terminal state are marked
+// interrupted (never auto-resumed; not persisted until the next Save).
+//
+// Callers should always check for ErrCorruptState/ErrUnsupportedVersion before
+// acting, since the existing file is preserved but cannot be used.
+func Open(path string) (*Store, error) {
+	if path == "" {
+		return nil, fmt.Errorf("state: empty path")
+	}
+	return openStore(path, &filePersistenceBackend{path: path})
+}
+
+// Path returns the state file location.
+func (s *Store) Path() string { return s.path }
+
+func cleanDocument() document {
+	return document{
+		Version:        CurrentVersion,
+		GitHub:         nil,
+		Drive:          nil,
+		ProtectedRepos: []ProtectedRepo{},
+		BackupRecords:  []BackupRecord{},
+		BackupJobs:     []BackupJob{},
+	}
+}
+
+// decode parses the raw state bytes, strictly. It returns ErrUnsupportedVersion
+// for a missing/unknown version and ErrCorruptState for any structural problem.
+// The file itself is never modified here.
+func (s *Store) decode(data []byte) error {
+	// Reject empty file / bare "null".
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return fmt.Errorf("%w: file is empty", ErrCorruptState)
+	}
+	// The document must be a JSON object. Anything else (null, array, scalar)
+	// is structurally invalid, not merely a version problem.
+	if trimmed[0] != '{' {
+		return fmt.Errorf("%w: top-level value is not an object", ErrCorruptState)
+	}
+
+	// First, triage the version independently so we can distinguish a bad
+	// version from general corruption.
+	var v struct {
+		Version *int `json:"version"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&v); err != nil {
+		return fmt.Errorf("%w: %v", ErrCorruptState, err)
+	}
+	if v.Version == nil {
+		return fmt.Errorf("%w: missing version field", ErrUnsupportedVersion)
+	}
+	if *v.Version != CurrentVersion {
+		return fmt.Errorf("%w: got %d, supported %d", ErrUnsupportedVersion, *v.Version, CurrentVersion)
+	}
+
+	// Full strict decode: unknown fields, wrong types, or trailing garbage all
+	// count as structurally invalid.
+	var doc document
+	dec2 := json.NewDecoder(bytes.NewReader(data))
+	dec2.DisallowUnknownFields()
+	if err := dec2.Decode(&doc); err != nil {
+		return fmt.Errorf("%w: %v", ErrCorruptState, err)
+	}
+	if err := ensureNoTrailing(dec2); err != nil {
+		return fmt.Errorf("%w: %v", ErrCorruptState, err)
+	}
+	if doc.GitHub == nil {
+		doc.GitHub = nil
+	}
+	if doc.Drive == nil {
+		doc.Drive = nil
+	}
+	if doc.ProtectedRepos == nil {
+		doc.ProtectedRepos = []ProtectedRepo{}
+	}
+	if doc.BackupRecords == nil {
+		doc.BackupRecords = []BackupRecord{}
+	}
+	if doc.BackupJobs == nil {
+		doc.BackupJobs = []BackupJob{}
+	}
+	s.doc = doc
+	return nil
+}
+
+func ensureNoTrailing(dec *json.Decoder) error {
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("unexpected trailing data after JSON document")
+		}
+		return err
+	}
+	return nil
+}
+
+// normalizeInterrupted marks any non-terminal job as interrupted. It runs only
+// in memory; the caller decides when to persist (next Save).
+func (s *Store) normalizeInterrupted() {
+	now := time.Now()
+	for i := range s.doc.BackupJobs {
+		j := &s.doc.BackupJobs[i]
+		if IsTerminalState(j.State) {
+			continue
+		}
+		if j.State != JobInterrupted {
+			j.State = JobInterrupted
+		}
+		if j.Error == "" {
+			j.Error = interruptedMessage
+		}
+		if j.FinishedAt.IsZero() {
+			j.FinishedAt = now
+		}
+	}
+}
+
+// Document returns a copy of the current state document. Calls that only need
+// to read state should prefer the typed accessors below.
+func (s *Store) Document() Document {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	d := Document{
+		Version:        s.doc.Version,
+		ProtectedRepos: cloneRepos(s.doc.ProtectedRepos),
+		BackupRecords:  cloneRecords(s.doc.BackupRecords),
+		BackupJobs:     cloneJobs(s.doc.BackupJobs),
+	}
+	if s.doc.GitHub != nil {
+		g := *s.doc.GitHub
+		d.GitHub = &g
+	}
+	if s.doc.Drive != nil {
+		g := *s.doc.Drive
+		d.Drive = &g
+	}
+	return d
+}
+
+// Save persists the current document. File persistence atomically replaces the
+// file; PostgreSQL persistence atomically upserts the user row.
+func (s *Store) Save() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked()
+}
+
+func (s *Store) saveLocked() error {
+	data, err := json.MarshalIndent(s.doc, "", "  ")
+	if err != nil {
+		return fmt.Errorf("state: marshal: %w", err)
+	}
+	return s.backend.save(data)
+}
+
+// --- Connections ---
+
+func (s *Store) GitHubConnection() (GitHubConnection, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.doc.GitHub == nil {
+		return GitHubConnection{}, false
+	}
+	return *s.doc.GitHub, true
+}
+
+func (s *Store) SetGitHubConnection(c GitHubConnection) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cc := c
+	s.doc.GitHub = &cc
+}
+
+func (s *Store) ClearGitHubConnection() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.doc.GitHub = nil
+}
+
+func (s *Store) DriveConnection() (DriveConnection, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.doc.Drive == nil {
+		return DriveConnection{}, false
+	}
+	return *s.doc.Drive, true
+}
+
+func (s *Store) SetDriveConnection(c DriveConnection) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cc := c
+	s.doc.Drive = &cc
+}
+
+func (s *Store) ClearDriveConnection() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.doc.Drive = nil
+}
+
+// ClearAll removes all user data from the store. Used for account deletion.
+func (s *Store) ClearAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.doc.GitHub = nil
+	s.doc.Drive = nil
+	s.doc.ProtectedRepos = nil
+	s.doc.BackupRecords = nil
+	s.doc.BackupJobs = nil
+}
+
+// --- Protected repositories ---
+
+func (s *Store) ProtectedRepos() []ProtectedRepo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneRepos(s.doc.ProtectedRepos)
+}
+
+func (s *Store) ProtectedRepo(id string) (ProtectedRepo, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, r := range s.doc.ProtectedRepos {
+		if r.ID == id {
+			return r, true
+		}
+	}
+	return ProtectedRepo{}, false
+}
+
+// AddProtectedRepo appends a new protected repository. It refuses duplicates by
+// GitHubID (a repository can only be protected once).
+func (s *Store) AddProtectedRepo(r ProtectedRepo) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.doc.ProtectedRepos {
+		if existing.GitHubID == r.GitHubID {
+			return fmt.Errorf("%w: repository %d already protected", ErrDuplicate, r.GitHubID)
+		}
+	}
+	s.doc.ProtectedRepos = append(s.doc.ProtectedRepos, r)
+	return nil
+}
+
+func (s *Store) UpdateProtectedRepo(r ProtectedRepo) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.doc.ProtectedRepos {
+		if s.doc.ProtectedRepos[i].ID == r.ID {
+			s.doc.ProtectedRepos[i] = r
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: protected repo %q", ErrNotFound, r.ID)
+}
+
+func (s *Store) RemoveProtectedRepo(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.doc.ProtectedRepos {
+		if s.doc.ProtectedRepos[i].ID == id {
+			s.doc.ProtectedRepos = append(s.doc.ProtectedRepos[:i], s.doc.ProtectedRepos[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: protected repo %q", ErrNotFound, id)
+}
+
+// --- Backup records ---
+
+// Retention limits. The whole document is rewritten on every Save (and stored
+// as one JSONB row in PostgreSQL), so unbounded history would make every job
+// transition slower and, with daily backups, grow without limit.
+const (
+	// MaxRecordsPerRepo is how many backup records are kept per repository.
+	// The newest record carrying a Drive file ID is always kept as well, so
+	// re-backups keep replacing the same Drive file.
+	MaxRecordsPerRepo = 30
+	// MaxRetainedJobs is how many backup jobs are kept. Only terminal jobs are
+	// ever pruned (oldest first); running jobs are never dropped.
+	MaxRetainedJobs = 200
+)
+
+func (s *Store) AddBackupRecord(rec BackupRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.doc.BackupRecords = append(s.doc.BackupRecords, rec)
+	s.doc.BackupRecords = PruneRecords(s.doc.BackupRecords, rec.ProtectedRepoID, MaxRecordsPerRepo)
+}
+
+// PruneRecords drops the oldest records of one repository so at most max
+// remain, always keeping the newest record that has a Drive file ID. Records of
+// other repositories and the relative order are untouched.
+func PruneRecords(records []BackupRecord, protectedRepoID string, max int) []BackupRecord {
+	if max <= 0 {
+		return records
+	}
+	var idx []int
+	for i := range records {
+		if records[i].ProtectedRepoID == protectedRepoID {
+			idx = append(idx, i)
+		}
+	}
+	if len(idx) <= max {
+		return records
+	}
+	keepDrive := -1
+	for i := len(idx) - 1; i >= 0; i-- {
+		if records[idx[i]].DriveFileID != "" {
+			keepDrive = idx[i]
+			break
+		}
+	}
+	drop := map[int]bool{}
+	excess := len(idx) - max
+	for _, i := range idx {
+		if excess == 0 {
+			break
+		}
+		if i == keepDrive {
+			continue
+		}
+		drop[i] = true
+		excess--
+	}
+	out := make([]BackupRecord, 0, len(records)-len(drop))
+	for i, r := range records {
+		if !drop[i] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (s *Store) BackupRecords() []BackupRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneRecords(s.doc.BackupRecords)
+}
+
+func (s *Store) BackupRecordsForRepo(protectedRepoID string) []BackupRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []BackupRecord{}
+	for _, r := range s.doc.BackupRecords {
+		if r.ProtectedRepoID == protectedRepoID {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// --- Backup jobs ---
+
+func (s *Store) CreateBackupJob(j BackupJob) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.doc.BackupJobs = append(s.doc.BackupJobs, j)
+	s.doc.BackupJobs = PruneJobs(s.doc.BackupJobs, MaxRetainedJobs)
+}
+
+// PruneJobs drops the oldest terminal jobs so at most max jobs remain. Running
+// jobs are never dropped, so the result can exceed max when many are running.
+func PruneJobs(jobs []BackupJob, max int) []BackupJob {
+	if max <= 0 || len(jobs) <= max {
+		return jobs
+	}
+	excess := len(jobs) - max
+	out := make([]BackupJob, 0, max)
+	for _, j := range jobs {
+		if excess > 0 && IsTerminalState(j.State) {
+			excess--
+			continue
+		}
+		out = append(out, j)
+	}
+	return out
+}
+
+func (s *Store) UpdateBackupJob(j BackupJob) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.doc.BackupJobs {
+		if s.doc.BackupJobs[i].ID == j.ID {
+			s.doc.BackupJobs[i] = j
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: backup job %q", ErrNotFound, j.ID)
+}
+
+func (s *Store) RemoveBackupJob(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.doc.BackupJobs {
+		if s.doc.BackupJobs[i].ID == id {
+			s.doc.BackupJobs = append(s.doc.BackupJobs[:i], s.doc.BackupJobs[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: backup job %q", ErrNotFound, id)
+}
+
+func (s *Store) BackupJob(id string) (BackupJob, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, j := range s.doc.BackupJobs {
+		if j.ID == id {
+			return j, true
+		}
+	}
+	return BackupJob{}, false
+}
+
+// BackupJobs returns a defensive copy of all persisted backup jobs.
+func (s *Store) BackupJobs() []BackupJob {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneJobs(s.doc.BackupJobs)
+}
+
+// UnfinishedJobs returns jobs that have not reached a terminal state.
+func (s *Store) UnfinishedJobs() []BackupJob {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []BackupJob{}
+	for _, j := range s.doc.BackupJobs {
+		if !IsTerminalState(j.State) {
+			out = append(out, j)
+		}
+	}
+	return out
+}
+
+// --- clone helpers (defensive copies for callers) ---
+
+func cloneRepos(in []ProtectedRepo) []ProtectedRepo {
+	if in == nil {
+		return nil
+	}
+	out := make([]ProtectedRepo, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneRecords(in []BackupRecord) []BackupRecord {
+	if in == nil {
+		return nil
+	}
+	out := make([]BackupRecord, len(in))
+	for i, r := range in {
+		out[i] = r
+		if r.HeadSHAs != nil {
+			m := make(map[string]string, len(r.HeadSHAs))
+			for k, v := range r.HeadSHAs {
+				m[k] = v
+			}
+			out[i].HeadSHAs = m
+		}
+	}
+	return out
+}
+
+func cloneJobs(in []BackupJob) []BackupJob {
+	if in == nil {
+		return nil
+	}
+	out := make([]BackupJob, len(in))
+	copy(out, in)
+	return out
+}

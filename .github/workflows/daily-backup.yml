@@ -1,0 +1,112 @@
+# Opt-in daily backups for GitSafe (free: GitHub Actions + Render free tier).
+#
+# Render's free tier has no cron jobs and sleeps after ~15 idle minutes, so
+# this scheduled workflow wakes the service, starts the daily run through the
+# protected endpoint, and polls it until it finishes (polling also keeps the
+# instance awake while it works).
+#
+# Setup (repository → Settings → Secrets and variables → Actions):
+#   vars.GITSAFE_URL (or secret GITSAFE_APP_URL): e.g. https://gitsafe.example.com (no trailing slash)
+#   secrets.GITSAFE_CRON_SECRET: the same value as GITSAFE_CRON_SECRET on your host
+#                                (generate with: openssl rand -hex 32)
+#
+# Notes: scheduled workflows run only from the default branch, may start a
+# few minutes late, and GitHub disables them in a public repository after 60
+# days without commits (re-enable from the Actions tab). In a private
+# repository the run time counts against the free 2,000 Actions minutes a
+# month; a typical run takes a few minutes.
+name: Daily backup
+
+on:
+  schedule:
+    - cron: "17 1 * * *" # 01:17 UTC (04:17 EAT) every day
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: gitsafe-daily-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    if: github.repository == 'b-isry/gitsafe' || vars.GITSAFE_URL != ''
+    timeout-minutes: 80
+    env:
+      APP_URL: ${{ vars.GITSAFE_URL || secrets.GITSAFE_APP_URL }}
+      CRON_SECRET: ${{ secrets.GITSAFE_CRON_SECRET }}
+    steps:
+      - name: Check configuration
+        run: |
+          if [ -z "$APP_URL" ] || [ -z "$CRON_SECRET" ]; then
+            echo "::notice::GITSAFE_URL (variable) or GITSAFE_APP_URL (secret), and GITSAFE_CRON_SECRET must be set; skipping daily backup."
+            echo "SKIP=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Wake the service (cold start)
+        if: env.SKIP != '1'
+        run: |
+          url="${APP_URL%/}/healthz"
+          for i in $(seq 1 12); do
+            if curl -fsS --max-time 90 "$url" > /dev/null; then
+              echo "GitSafe is awake."
+              exit 0
+            fi
+            echo "Not ready yet (attempt $i/12); retrying in 15s."
+            sleep 15
+          done
+          echo "::error::GitSafe did not respond on /healthz."
+          exit 1
+
+      - name: Run daily backup
+        if: env.SKIP != '1'
+        run: |
+          set -euo pipefail
+          base="${APP_URL%/}"
+          auth="Authorization: Bearer ${CRON_SECRET}"
+          curl_json() {
+            curl -fsS --retry 5 --retry-all-errors --retry-delay 10 --max-time 60 -H "$auth" "$@"
+          }
+          start_run() {
+            curl_json -X POST "$base/api/cron/backup"
+          }
+
+          resp="$(start_run)"
+          echo "$resp" | jq -c .
+          run_id="$(echo "$resp" | jq -r '.run.id')"
+          restarts=0
+          deadline=$(( $(date +%s) + 70 * 60 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            sleep 60
+            status="$(curl_json "$base/api/cron/backup" || echo '{}')"
+            running="$(echo "$status" | jq -r '.running // false')"
+            id="$(echo "$status" | jq -r '.run.id // empty')"
+            if [ "$running" = "true" ]; then
+              echo "$status" | jq -c '.run'
+              continue
+            fi
+            if [ -n "$id" ] && [ "$id" = "$run_id" ]; then
+              echo "Daily backup finished:"
+              echo "$status" | jq '.run'
+              err="$(echo "$status" | jq -r '.run.error // empty')"
+              if [ -n "$err" ]; then echo "::error::$err"; exit 1; fi
+              failed="$(echo "$status" | jq -r '.run.failed // 0')"
+              reauth="$(echo "$status" | jq -r '.run.needsReauth // 0')"
+              if [ "$failed" != "0" ] || [ "$reauth" != "0" ]; then
+                echo "::warning::$failed repository backups failed; $reauth users need to reconnect (see the GitSafe dashboard)."
+              fi
+              exit 0
+            fi
+            # The service restarted (deploy or spin-down) and lost the run.
+            # Runs are resumable: repositories already backed up are skipped.
+            restarts=$((restarts + 1))
+            if [ "$restarts" -gt 3 ]; then
+              echo "::error::The daily run was interrupted repeatedly."
+              exit 1
+            fi
+            echo "::warning::Run $run_id is gone (service restarted?); starting it again."
+            resp="$(start_run)"
+            run_id="$(echo "$resp" | jq -r '.run.id')"
+          done
+          echo "::warning::Still running after the polling window; the service continues until its own time limit and the next run picks up the rest."

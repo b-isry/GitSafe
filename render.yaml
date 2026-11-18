@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: gitsafe
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: GITSAFE_BASE_URL
+        sync: false
+      - key: GITSAFE_GITHUB_CLIENT_ID
+        sync: false
+      - key: GITSAFE_GITHUB_CLIENT_SECRET
+        sync: false
+      - key: GITSAFE_DRIVE_CLIENT_ID
+        sync: false
+      - key: GITSAFE_DRIVE_CLIENT_SECRET
+        sync: false
+      # Encryption key material for PostgreSQL-backed tokens (required in production).
+      # Generate with: openssl rand -hex 32
+      - key: GITSAFE_TOKEN_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      # Optional: dedicated key for signing session/OAuth-state cookies. When
+      # unset it is derived from GITSAFE_TOKEN_KEY. Rotating it signs everyone out.
+      - key: GITSAFE_SESSION_KEY
+        sync: false
+      # Optional: enables opt-in daily backups (POST /api/cron/backup, called by
+      # .github/workflows/daily-backup.yml). At least 32 characters.
+      # Generate with: openssl rand -hex 32. Use the same value as the
+      # GITSAFE_CRON_SECRET GitHub Actions secret.
+      - key: GITSAFE_CRON_SECRET
+        sync: false
